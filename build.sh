@@ -29,11 +29,14 @@ KLEAF_ARGS=("${DEBUG_ARGS} ${SANDBOX_ARGS} \
 
 set -x
 (
-  export ${BAZEL_EXPORT_ENV} && \
-	tools/bazel ${KLEAF_OUT} build ${KLEAF_ARGS} ${KLEAF_BUILD_TARGET}
-  export ${BAZEL_EXPORT_ENV} && \
-	tools/bazel ${KLEAF_OUT} run ${KLEAF_ARGS} \
-	--nokmi_symbol_list_violations_check ${KLEAF_DIST_TARGET} -- --dist_dir=${OUT_DIR}/dist
+  export BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=1
+  export KERNEL_VERSION="${KERNEL_VERSION}"
+  export DEFCONFIG_OVERLAYS="${DEFCONFIG_OVERLAYS}"
+  
+  tools/bazel ${KLEAF_OUT} build ${KLEAF_ARGS} ${KLEAF_BUILD_TARGET}
+  
+  tools/bazel ${KLEAF_OUT} run ${KLEAF_ARGS} \
+        --nokmi_symbol_list_violations_check ${KLEAF_DIST_TARGET} -- --dist_dir=${OUT_DIR}/dist
 )
 set +x
 

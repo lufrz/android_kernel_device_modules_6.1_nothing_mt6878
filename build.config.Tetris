@@ -1,5 +1,5 @@
 . ${ROOT_DIR}/${DEVICE_MODULES_DIR}/build.config.mtk_kernel_device_modules
 . ${ROOT_DIR}/${DEVICE_MODULES_DIR}/build.config.lto_thin
-DEFCONFIG_OVERLAYS="Tetris.config"
+DEFCONFIG_OVERLAYS="Tetris.config bliss.config"
 
 TARGET_BUILD_VARIANT=user
