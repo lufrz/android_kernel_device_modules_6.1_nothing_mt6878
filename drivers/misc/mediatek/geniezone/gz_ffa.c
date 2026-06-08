@@ -229,7 +229,7 @@ static long memory_send(bool share, bool involve_sp,
 	void *mem_region;
 	char *buf;
 	struct sg_table sgt;
-	struct page **pages;
+	struct page **pages = NULL;
 	struct ffa_mem_ops_args args;
 	u32 index;
 	struct ffa_mem_region_attributes mem_region_attributes[VM_NUMBER_MAX+1];
