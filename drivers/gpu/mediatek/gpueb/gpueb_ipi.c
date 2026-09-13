@@ -328,11 +328,7 @@ int gpueb_ipi_init(struct platform_device *pdev)
 			continue;
 		}
 
-		ret = enable_irq_wake(gpueb_mboxdev.info_table[i].irq_num);
-		if (ret < 0) {
-			gpueb_pr_debug("mbox%d enable irq fail, ret = %d", i, ret);
-			continue;
-		}
+		/* mtk_mbox_probe already requests with IRQF_NO_SUSPEND. */
 		gpueb_mbox_setup_pin_table(i);
 	}
 

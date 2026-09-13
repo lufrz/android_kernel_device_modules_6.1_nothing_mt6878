@@ -2896,11 +2896,10 @@ static int scp_device_probe(struct platform_device *pdev)
 			continue;
 		}
 
-		ret = enable_irq_wake(scp_mboxdev.info_table[i].irq_num);
-		if (ret < 0) {
-			pr_notice("[SCP]mbox%d enable irq fail\n", i);
-			continue;
-		}
+		/* mtk_mbox_probe already requests with IRQF_NO_SUSPEND.
+		 * Do not call enable_irq_wake here, as pairing IRQF_NO_SUSPEND with
+		 * enable_irq_wake causes a 'misconfigured IRQ' warning in kernel/irq/chip.c.
+		 */
 		mbox_setup_pin_table(i);
 	}
 

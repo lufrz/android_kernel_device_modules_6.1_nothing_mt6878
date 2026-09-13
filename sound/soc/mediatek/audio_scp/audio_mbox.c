@@ -248,11 +248,7 @@ static int scp_audio_mbox_dev_probe(struct platform_device *pdev)
 			goto EXIT;
 		}
 
-		ret = enable_irq_wake(mbdev->info_table[idx].irq_num);
-		if (ret) {
-			pr_warn("%s, enable_irq_wake id %d fail ret (%d)", __func__, idx, ret);
-			goto EXIT;
-		}
+		/* mtk_mbox_probe already requests with IRQF_NO_SUSPEND. */
 	}
 
 	for (idx = 0; idx < mbdev->send_count; idx++)
