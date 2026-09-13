@@ -218,6 +218,7 @@ void timesync_resume(void)
 {
 	pr_info("host resume boottime %lld\n", ktime_get_boottime_ns());
 	WRITE_ONCE(timesync_suspend_flag, false);
+	timesync_start();
 	timesync_comm_with();
 }
 
@@ -225,6 +226,10 @@ void timesync_suspend(void)
 {
 	pr_info("host suspend boottime %lld\n", ktime_get_boottime_ns());
 	WRITE_ONCE(timesync_suspend_flag, true);
+	del_timer_sync(&timesync_timer);
+	cancel_work_sync(&timesync_work);
+	if (wakeup_src && wakeup_src->active)
+		__pm_relax(wakeup_src);
 }
 
 int timesync_init(void)

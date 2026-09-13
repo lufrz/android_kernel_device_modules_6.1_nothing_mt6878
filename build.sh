@@ -25,6 +25,7 @@ KLEAF_DIST_TARGET=//${DEVICE_MODULES_DIR}:${KLEAF_SUPPORTED_PROJECTS}_${build_sc
 KLEAF_OUT=("--output_user_root=${OUT_DIR} --output_base=${OUT_DIR}/bazel/output_user_root/output_base")
 KLEAF_ARGS=("${DEBUG_ARGS} ${SANDBOX_ARGS} \
 	--experimental_writable_outputs \
+	--action_env=SOURCE_DATE_EPOCH \
 	--//build/bazel_mgk_rules:kernel_version=${KERNEL_VERSION_NUM}")
 
 set -x
@@ -32,6 +33,7 @@ set -x
   export BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=1
   export KERNEL_VERSION="${KERNEL_VERSION}"
   export DEFCONFIG_OVERLAYS="${DEFCONFIG_OVERLAYS}"
+  export SOURCE_DATE_EPOCH=$(date +%s)
   
   tools/bazel ${KLEAF_OUT} build ${KLEAF_ARGS} ${KLEAF_BUILD_TARGET}
   

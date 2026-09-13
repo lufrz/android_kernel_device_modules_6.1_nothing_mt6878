@@ -1583,10 +1583,17 @@ static int nt_charger_pm_event(struct notifier_block *notifier,
 	nci = container_of(notifier, struct nt_chg_info, pm_notifier);
 
 	switch (pm_event) {
-	case PM_SUSPEND_PREPARE:
+	case PM_SUSPEND_PREPARE: {
+		unsigned long flags;
+
 		nci->is_suspend = true;
 		pr_err("%s: enter PM_SUSPEND_PREPARE\n", __func__);
+		spin_lock_irqsave(&nci->slock, flags);
+		if (nci->charger_wakelock && nci->charger_wakelock->active)
+			__pm_relax(nci->charger_wakelock);
+		spin_unlock_irqrestore(&nci->slock, flags);
 		break;
+	}
 	case PM_POST_SUSPEND:
 		nci->is_suspend = false;
 		pr_err("%s: enter PM_POST_SUSPEND\n", __func__);

@@ -1510,7 +1510,7 @@ void _wake_up_nt_charger(struct nt_chg_info *nci)
 {
 	unsigned long flags;
 
-	if (nci == NULL)
+	if (nci == NULL || nci->is_suspend)
 		return;
 	spin_lock_irqsave(&nci->slock, flags);
 	if (!nci->charger_wakelock->active)
@@ -1647,33 +1647,27 @@ static void nt_charger_external_power_changed(struct power_supply *psy)
 static int nt_charger_pm_event(struct notifier_block *notifier,
 			unsigned long pm_event, void *unused)
 {
-	ktime_t ktime_now;
-	struct timespec64 now;
 	struct nt_chg_info *nci;
 
 	nci = container_of(notifier, struct nt_chg_info, pm_notifier);
 
 	switch (pm_event) {
-	case PM_SUSPEND_PREPARE:
+	case PM_SUSPEND_PREPARE: {
+		unsigned long flags;
+
 		nci->is_suspend = true;
 		pr_err("%s: enter PM_SUSPEND_PREPARE\n", __func__);
+		cancel_delayed_work_sync(&nci->nt_update_status_work);
+		spin_lock_irqsave(&nci->slock, flags);
+		if (nci->charger_wakelock && nci->charger_wakelock->active)
+			__pm_relax(nci->charger_wakelock);
+		spin_unlock_irqrestore(&nci->slock, flags);
 		break;
+	}
 	case PM_POST_SUSPEND:
 		nci->is_suspend = false;
 		pr_err("%s: enter PM_POST_SUSPEND\n", __func__);
-		ktime_now = ktime_get_boottime();
-		now = ktime_to_timespec64(ktime_now);
-
-		if (timespec64_compare(&now, &nci->endtime) >= 0 &&
-			nci->endtime.tv_sec != 0 &&
-			nci->endtime.tv_nsec != 0) {
-			pr_err("%s: alarm timeout, wake up charger\n",
-				__func__);
-			//__pm_relax(nci->charger_wakelock);
-			nci->endtime.tv_sec = 0;
-			nci->endtime.tv_nsec = 0;
-			//_wake_up_nt_charger(nci);
-		}
+		queue_delayed_work(system_wq, &nci->nt_update_status_work, 0);
 		break;
 	default:
 		break;
@@ -1921,6 +1915,10 @@ static void nt_update_status_function_work(struct work_struct *work)
 	delay_work = to_delayed_work(work);
 	nci = container_of(delay_work, struct nt_chg_info, nt_update_status_work);
 
+	if (nci->is_suspend) {
+		return;
+	}
+
 	//while (1) {
 		//ret = wait_event_interruptible(nci->wait_que,
 		//	(nci->charger_thread_timeout == true));
@@ -1991,8 +1989,9 @@ static void nt_update_status_function_work(struct work_struct *work)
 		spin_unlock_irqrestore(&nci->slock, flags);
 		nt_update_wakeup_status(nci);
 		mutex_unlock(&nci->charger_lock);
-		queue_delayed_work(system_wq, &nci->nt_update_status_work,
-									round_jiffies(10 * HZ));
+		if (!nci->is_suspend)
+			queue_delayed_work(system_wq, &nci->nt_update_status_work,
+										round_jiffies(10 * HZ));
 
 	//}
 	return;
