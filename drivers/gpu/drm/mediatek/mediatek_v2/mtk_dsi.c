@@ -11377,9 +11377,10 @@ static int mtk_dsi_io_cmd(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle,
 			reset_dsi_wq(&dsi->frame_done);
 			ret = wait_dsi_wq(&dsi->frame_done, HZ);
 		}
-		if (!ret)
-			DDPINFO("%s: DSI_HBM_WAIT failed\n", __func__);
-		break;
+		if (ret <= 0)
+			DDPINFO("%s: DSI_HBM_WAIT failed: %d\n", __func__, ret);
+		/* wait_dsi_wq returns remaining jiffies on a real frame/TE wake. */
+		return ret > 0 ? 0 : (ret < 0 ? ret : -ETIMEDOUT);
 	}
 	case LCM_ATA_CHECK:
 	{
