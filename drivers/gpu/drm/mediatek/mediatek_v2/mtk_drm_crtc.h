@@ -1425,6 +1425,9 @@ bool mtk_crtc_is_dual_pipe(struct drm_crtc *crtc);
 bool mtk_crtc_is_tetris_vdo_panel(struct mtk_drm_crtc *mtk_crtc);
 struct cmdq_client *mtk_crtc_tetris_dsi_client(struct mtk_drm_crtc *crtc);
 int mtk_crtc_tetris_dsi_hbm_begin(struct mtk_drm_crtc *crtc);
+int mtk_crtc_tetris_hbm_scan_cmd(struct mtk_drm_crtc *crtc, const char *buf, size_t count);
+void mtk_crtc_tetris_hbm_scan_clear(struct mtk_drm_crtc *crtc);
+void mtk_crtc_tetris_hbm_scan_hbm(struct mtk_drm_crtc *crtc, bool en);
 
 enum tetris_hbm_timing_point {
 	TETRIS_HBM_TIMING_EOF, TETRIS_HBM_TIMING_PLANES,
