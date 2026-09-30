@@ -194,8 +194,11 @@ enum DISP_VBLANK_REC_JOB_TYPE {
 #define DISP_SLOT_VBLANK_REC(n)		\
 	(DISP_SLOT_LAYER_PEAK_RATIO(MAX_FRAME_RATIO_NUMBER * MAX_LAYER_RATIO_NUMBER) + 0x4 + (0x4 * (n)))
 
-#define DISP_SLOT_SIZE            \
+#define DISP_SLOT_TETRIS_HBM_TIMING_BASE \
 	(DISP_SLOT_VBLANK_REC(MAX_DISP_VBLANK_REC_THREAD * (MAX_DISP_VBLANK_REC_JOB + 2)) + 0x4)
+#define DISP_SLOT_TETRIS_HBM_TIMING(n) \
+	(DISP_SLOT_TETRIS_HBM_TIMING_BASE + (n) * 15 * 4)
+#define DISP_SLOT_SIZE DISP_SLOT_TETRIS_HBM_TIMING(8)
 
 #if DISP_SLOT_SIZE > CMDQ_BUF_ALLOC_SIZE
 #error "DISP_SLOT_SIZE exceed CMDQ_BUF_ALLOC_SIZE"
@@ -1423,6 +1426,15 @@ bool mtk_crtc_is_tetris_vdo_panel(struct mtk_drm_crtc *mtk_crtc);
 struct cmdq_client *mtk_crtc_tetris_dsi_client(struct mtk_drm_crtc *crtc);
 int mtk_crtc_tetris_dsi_hbm_begin(struct mtk_drm_crtc *crtc);
 
+enum tetris_hbm_timing_point {
+	TETRIS_HBM_TIMING_EOF, TETRIS_HBM_TIMING_PLANES,
+	TETRIS_HBM_TIMING_MIX, TETRIS_HBM_TIMING_DONE,
+	TETRIS_HBM_TIMING_MUTEX, TETRIS_HBM_TIMING_END,
+	TETRIS_HBM_TIMING_COUNT
+};
+void mtk_crtc_tetris_hbm_timing_sample(struct mtk_drm_crtc *crtc,
+		struct cmdq_pkt *pkt, enum tetris_hbm_timing_point point);
+ssize_t mtk_crtc_tetris_hbm_timing_dump(struct mtk_drm_crtc *crtc, char *buf);
 int mtk_drm_crtc_set_panel_hbm(struct drm_crtc *crtc, bool en);
 int mtk_drm_crtc_set_panel_hbm_sync(struct drm_crtc *crtc, bool en);
 int mtk_drm_crtc_hbm_wait(struct drm_crtc *crtc, bool en);
