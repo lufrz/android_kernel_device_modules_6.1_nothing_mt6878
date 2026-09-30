@@ -2228,18 +2228,19 @@ int mtk_drm_crtc_set_panel_lhbm(struct drm_crtc *crtc, bool en)
 	return 0;
 }
 
-int mtk_drm_crtc_set_panel_hbm(struct drm_crtc *crtc, bool en)
+static int mtk_drm_crtc_set_panel_hbm_internal(struct drm_crtc *crtc,
+		bool en, bool sync)
 {
 	struct mtk_drm_crtc *mtk_crtc = to_mtk_crtc(crtc);
 	struct mtk_ddp_comp *comp = mtk_ddp_comp_request_output(mtk_crtc);
+	struct mtk_crtc_state *mtk_state = to_mtk_crtc_state(crtc->state);
+	struct mtk_cmdq_cb_data *cb_data = NULL;
 	struct cmdq_pkt *cmdq_handle;
 	struct cmdq_client *client;
 	bool is_frame_mode;
 	bool state = false;
-
 	int fps = drm_mode_vrefresh(&crtc->state->adjusted_mode);
-	struct mtk_crtc_state *mtk_state = to_mtk_crtc_state(crtc->state);
-	struct mtk_cmdq_cb_data *cb_data;
+	int ret;
 
 	if (!(comp && comp->funcs && comp->funcs->io_cmd))
 		return -EINVAL;
@@ -2259,25 +2260,24 @@ int mtk_drm_crtc_set_panel_hbm(struct drm_crtc *crtc, bool en)
 
 	is_frame_mode = mtk_crtc_is_frame_trigger_mode(&mtk_crtc->base);
 
-	/* setHBM would use VM CMD in  DSI VDO mode only */
-	client = (is_frame_mode || mtk_crtc->gce_obj.client[CLIENT_DSI_CFG] == NULL) ?
+	/* setHBM would use VM CMD in DSI VDO mode only. */
+	client = (is_frame_mode ||
+		  mtk_crtc->gce_obj.client[CLIENT_DSI_CFG] == NULL) ?
 		mtk_crtc->gce_obj.client[CLIENT_CFG] : mtk_crtc->gce_obj.client[CLIENT_DSI_CFG];
-	cmdq_handle =
-		cmdq_pkt_create(client);
-
+	cmdq_handle = cmdq_pkt_create(client);
 	if (!cmdq_handle) {
 		DDPPR_ERR("%s:%d NULL cmdq handle\n", __func__, __LINE__);
-		return -EINVAL;
+		return -ENOMEM;
 	}
 
-	/* clear cmdq before set hbm */
-	cmdq_pkt_flush(cmdq_handle);
-
-	/*Wait TE, then set hbm cmd*/
-	if (!mtk_state->prop_val[CRTC_PROP_DOZE_ACTIVE]) {
-		comp->funcs->io_cmd(comp, NULL, DSI_HBM_WAIT, NULL);
+	if (!sync) {
+		/* Preserve the legacy atomic-commit timing. */
+		cmdq_pkt_flush(cmdq_handle);
+		if (!mtk_state->prop_val[CRTC_PROP_DOZE_ACTIVE])
+			comp->funcs->io_cmd(comp, NULL, DSI_HBM_WAIT, NULL);
 	}
 
+	/* The sysfs path needs only the hardware frame boundary below. */
 	mtk_crtc_wait_frame_done(mtk_crtc, cmdq_handle, DDP_FIRST_PATH, 0);
 
 	if (is_frame_mode) {
@@ -2287,19 +2287,22 @@ int mtk_drm_crtc_set_panel_hbm(struct drm_crtc *crtc, bool en)
 				mtk_crtc->gce_obj.event[EVENT_CABC_EOF]);
 	}
 
-	/* Not do cmdq flush at commit thread */
-	cb_data = kmalloc(sizeof(*cb_data), GFP_KERNEL);
-	if (!cb_data) {
-		DDPPR_ERR("cb data creation failed\n");
-		return -EINVAL;
+	/* Only the legacy enable path hands packet ownership to a callback. */
+	if (en && !sync) {
+		cb_data = kmalloc(sizeof(*cb_data), GFP_KERNEL);
+		if (!cb_data) {
+			ret = -ENOMEM;
+			goto destroy;
+		}
+		cb_data->crtc = crtc;
+		cb_data->cmdq_handle = cmdq_handle;
 	}
 
-	cb_data->crtc = crtc;
-	cb_data->cmdq_handle = cmdq_handle;
-
 	mtk_drm_trace_begin("DSI_HBM_SET: %d", en);
-	comp->funcs->io_cmd(comp, cmdq_handle, DSI_HBM_SET, &en);
+	ret = comp->funcs->io_cmd(comp, cmdq_handle, DSI_HBM_SET, &en);
 	mtk_drm_trace_end("DSI_HBM_SET: %d", en);
+	if (ret < 0)
+		goto destroy;
 
 	if (is_frame_mode) {
 		cmdq_pkt_set_event(cmdq_handle,
@@ -2308,20 +2311,31 @@ int mtk_drm_crtc_set_panel_hbm(struct drm_crtc *crtc, bool en)
 				mtk_crtc->gce_obj.event[EVENT_STREAM_BLOCK]);
 	}
 
-	if (en) {
-		cmdq_pkt_flush_threaded(cmdq_handle, hbm_cmdq_cb, cb_data);
-		if (fps == 120) {
-			/* dealy one frame to wait hbm work */
-			if (!mtk_state->prop_val[CRTC_PROP_DOZE_ACTIVE]) {
-				comp->funcs->io_cmd(comp, NULL, DSI_HBM_WAIT, NULL);
-			}
-		}
-	} else {
-		cmdq_pkt_flush(cmdq_handle);
-		cmdq_pkt_destroy(cmdq_handle);
+	if (en && !sync) {
+		ret = cmdq_pkt_flush_threaded(cmdq_handle, hbm_cmdq_cb, cb_data);
+		if (ret < 0)
+			goto destroy;
+		if (fps == 120 && !mtk_state->prop_val[CRTC_PROP_DOZE_ACTIVE])
+			comp->funcs->io_cmd(comp, NULL, DSI_HBM_WAIT, NULL);
+		return 0;
 	}
 
-	return 0;
+	/* Completion acknowledges CMDQ, not the panel's optical response. */
+	ret = cmdq_pkt_flush(cmdq_handle);
+destroy:
+	cmdq_pkt_destroy(cmdq_handle);
+	kfree(cb_data);
+	return ret;
+}
+
+int mtk_drm_crtc_set_panel_hbm(struct drm_crtc *crtc, bool en)
+{
+	return mtk_drm_crtc_set_panel_hbm_internal(crtc, en, false);
+}
+
+int mtk_drm_crtc_set_panel_hbm_sync(struct drm_crtc *crtc, bool en)
+{
+	return mtk_drm_crtc_set_panel_hbm_internal(crtc, en, true);
 }
 
 int mtk_drm_crtc_hbm_wait(struct drm_crtc *crtc, bool en)

@@ -10230,7 +10230,6 @@ static void mtk_dsi_vdo_timing_change(struct mtk_dsi *dsi,
 			state->prop_val[CRTC_PROP_DISP_MODE_IDX]);
 	//1.fps change index
 	fps_chg_index = mtk_crtc->mode_change_index;
-
 	mtk_drm_idlemgr_kick(__func__, &(mtk_crtc->base), 0);
 
 	cb_data = kmalloc(sizeof(*cb_data), GFP_KERNEL);
@@ -12081,36 +12080,105 @@ static int mtk_dsi_set_partial_update(struct mtk_ddp_comp *comp,
 	return 0;
 }
 
+/*
+ * encoder.crtc is a legacy pointer which the atomic helper temporarily clears
+ * during modesets. DSI data paths with one possible CRTC can instead use the
+ * fixed CRTC table. sysfs is removed before component teardown frees that table.
+ */
+static struct mtk_drm_crtc *mtk_dsi_hbm_crtc(struct mtk_dsi *dsi)
+{
+	struct drm_device *drm;
+	struct mtk_drm_private *priv;
+	struct drm_crtc *crtc;
+	unsigned int possible_crtcs;
+	unsigned int index;
+
+	if (!dsi || dsi->is_slave)
+		return NULL;
+
+	drm = dsi->encoder.dev;
+	if (!drm || !READ_ONCE(drm->registered))
+		return NULL;
+
+	priv = drm->dev_private;
+	possible_crtcs = dsi->encoder.possible_crtcs;
+	if (!priv || !possible_crtcs ||
+	    (possible_crtcs & (possible_crtcs - 1)))
+		return NULL;
+
+	index = __ffs(possible_crtcs);
+	if (index >= MAX_CRTC)
+		return NULL;
+
+	crtc = READ_ONCE(priv->crtc[index]);
+	return crtc ? to_mtk_crtc(crtc) : NULL;
+}
+
 static ssize_t hbm_show(struct device *dev, struct device_attribute *attr,
 			char *buf)
 {
 	struct mtk_dsi *dsi = dev_get_drvdata(dev);
-	struct mtk_panel_ext *ext = dsi->ext;
+	struct mtk_drm_crtc *mtk_crtc = mtk_dsi_hbm_crtc(dsi);
+	struct mtk_panel_ext *ext;
 	bool hbm = false;
-	if (ext && ext->funcs && ext->funcs->hbm_get_state)
+
+	if (!mtk_crtc)
+		return scnprintf(buf, PAGE_SIZE, "0\n");
+
+	mutex_lock(&mtk_crtc->lock);
+	ext = dsi->ext;
+	if (mtk_crtc->base.state && mtk_crtc->enabled && dsi->panel &&
+	    mtk_ddp_comp_request_output(mtk_crtc) == &dsi->ddp_comp &&
+	    ext && ext->funcs && ext->funcs->hbm_get_state)
 		ext->funcs->hbm_get_state(dsi->panel, &hbm);
-	else
-		DDPPR_ERR("%s: hbm_get_state is NULL\n", __func__);
+	mutex_unlock(&mtk_crtc->lock);
+
 	return scnprintf(buf, PAGE_SIZE, "%d\n", hbm);
 }
+
 static ssize_t hbm_store(struct device *dev, struct device_attribute *attr,
 			 const char *buf, size_t count)
 {
 	struct mtk_dsi *dsi = dev_get_drvdata(dev);
-	struct drm_crtc *crtc = dsi->encoder.crtc;
-	struct mtk_drm_crtc *mtk_crtc = to_mtk_crtc(crtc);
-	bool hbm_en = false;
-	int ret = 0;
+	struct mtk_drm_crtc *mtk_crtc;
+	struct drm_crtc *crtc;
+	bool hbm_en;
+	int ret;
+
 	ret = kstrtobool(buf, &hbm_en);
 	if (ret)
 		return ret;
+
+	mtk_crtc = mtk_dsi_hbm_crtc(dsi);
+	if (!mtk_crtc)
+		return hbm_en ? -EAGAIN : count;
+
+	/* Atomic commits hold this lock across state swap and panel programming. */
+	mutex_lock(&mtk_crtc->lock);
+	crtc = &mtk_crtc->base;
+	if (!hbm_en) {
+		mtk_crtc->hbm_requested = false;
+	}
+
+	/* An off request must also work before the first frame and during suspend. */
+	if (!crtc->state || !mtk_crtc->enabled || !dsi->panel ||
+	    mtk_ddp_comp_request_output(mtk_crtc) != &dsi->ddp_comp) {
+		ret = hbm_en ? -EAGAIN : 0;
+		goto unlock;
+	}
+
 	mtk_crtc->hbm_requested = hbm_en;
-	ret = mtk_drm_crtc_set_panel_hbm(crtc, hbm_en);
-	if (ret)
-		return ret;
-	return count;
+	/* This helper expects the caller to hold the CRTC lock. */
+	ret = mtk_drm_crtc_set_panel_hbm_sync(crtc, hbm_en);
+	if (ret && hbm_en)
+		mtk_crtc->hbm_requested = false;
+
+unlock:
+	mutex_unlock(&mtk_crtc->lock);
+	return ret ? ret : count;
 }
 static DEVICE_ATTR_RW(hbm);
+
 // Initialization
 static struct attribute *mtk_dsi_attrs[] = {
 	&dev_attr_hbm.attr,
@@ -12165,6 +12233,10 @@ static int mtk_dsi_bind(struct device *dev, struct device *master, void *data)
 		goto err_unregister;
 	}
 
+	ret = mtk_dsi_sysfs_init(dsi);
+	if (ret)
+		dev_err(dev, "Failed to initialize HBM sysfs: %d\n", ret);
+
 	DDPINFO("%s-\n", __func__);
 	return 0;
 
@@ -12183,6 +12255,8 @@ static void mtk_dsi_unbind(struct device *dev, struct device *master,
 	if (dsi->is_slave)
 		return;
 
+	/* Drain active sysfs callbacks before encoder/CRTC teardown. */
+	sysfs_remove_group(&dev->kobj, &mtk_dsi_attr_group);
 	mtk_dsi_destroy_conn_enc(dsi);
 	mipi_dsi_host_unregister(&dsi->host);
 	mtk_ddp_comp_unregister(drm, &dsi->ddp_comp);
@@ -12768,11 +12842,6 @@ static int mtk_dsi_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, dsi);
 
-	ret = mtk_dsi_sysfs_init(dsi);
-	if (ret) {
-		dev_err(dev, "Failed to initialize sysfs: %d\n", ret);
-	}
-
 	ret = component_add(&pdev->dev, &mtk_dsi_component_ops);
 	if (ret != 0) {
 		dev_err(dev, "Failed to add component: %d\n", ret);
@@ -12793,6 +12862,7 @@ static int mtk_dsi_remove(struct platform_device *pdev)
 {
 	struct mtk_dsi *dsi = platform_get_drvdata(pdev);
 
+	sysfs_remove_group(&pdev->dev.kobj, &mtk_dsi_attr_group);
 	mtk_output_dsi_disable(dsi, NULL, false);
 	component_del(&pdev->dev, &mtk_dsi_component_ops);
 
