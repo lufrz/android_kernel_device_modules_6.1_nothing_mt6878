@@ -11278,6 +11278,7 @@ static int mtk_dsi_io_cmd(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle,
 		ret = mtk_crtc_tetris_dsi_hbm_begin(crtc);
 		if (ret)
 			return ret == -EOPNOTSUPP ? -EIO : ret;
+		mtk_crtc_tetris_hbm_scan_hbm(crtc, *(bool *)params);
 		panel_ext = mtk_dsi_get_panel_ext(comp);
 		if (dsi->ext && dsi->ext->params)
 			params_config = crtc->panel_ext->params;
@@ -12156,6 +12157,16 @@ static ssize_t hbm_store(struct device *dev, struct device_attribute *attr,
 	bool hbm_en;
 	int ret;
 
+	/* Versioned context commands never pass through the permissive boolean parser. */
+	if (count >= 7 && !strncmp(buf, "scan_v1", 7)) {
+		mtk_crtc = mtk_dsi_hbm_crtc(dsi);
+		if (!mtk_crtc)
+			return -EAGAIN;
+		mutex_lock(&mtk_crtc->lock);
+		ret = mtk_crtc_tetris_hbm_scan_cmd(mtk_crtc, buf, count);
+		mutex_unlock(&mtk_crtc->lock);
+		return ret ? ret : count;
+	}
 	ret = kstrtobool(buf, &hbm_en);
 	if (ret)
 		return ret;
@@ -12168,6 +12179,7 @@ static ssize_t hbm_store(struct device *dev, struct device_attribute *attr,
 	mutex_lock(&mtk_crtc->lock);
 	crtc = &mtk_crtc->base;
 	if (!hbm_en) {
+		mtk_crtc_tetris_hbm_scan_clear(mtk_crtc);
 		mtk_crtc->hbm_requested = false;
 	}
 

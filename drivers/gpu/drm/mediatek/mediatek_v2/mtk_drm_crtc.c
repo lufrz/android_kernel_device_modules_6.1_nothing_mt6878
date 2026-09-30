@@ -1608,6 +1608,7 @@ bool mtk_crtc_is_tetris_vdo_panel(struct mtk_drm_crtc *mtk_crtc)
 		dsi->ext->params->vdo_mix_mode_en;
 }
 
+
 /*
  * Normal brightness uses DSI_CFG; HBM and its mask use CFG. All submitters
  * hold crtc.lock. The callback only acknowledges a specific OFF packet and
@@ -1822,6 +1823,22 @@ static u32 tetris_hbm_frame_elapsed(const struct tetris_hbm_frame_result *result
 	return div_u64(ktime_get_ns() - result->start_ns, NSEC_PER_USEC);
 }
 
+enum tetris_hbm_scan_mode {
+	TETRIS_HBM_SCAN_NONE, TETRIS_HBM_SCAN_INTERACTIVE, TETRIS_HBM_SCAN_AMBIENT,
+};
+
+struct tetris_hbm_scan_snapshot {
+	u64 token, expires_ns;
+	bool interactive;
+};
+
+struct tetris_hbm_scan_context {
+	struct mtk_drm_crtc *crtc;
+	u64 token, expires_ns;
+	enum tetris_hbm_scan_mode mode;
+	bool pending, cycle_open, stock_latched;
+};
+
 struct tetris_hbm_timing_record {
 	struct cmdq_pkt *owner;
 	struct mtk_drm_crtc *crtc;
@@ -1830,6 +1847,7 @@ struct tetris_hbm_timing_record {
 	int status;
 	bool pending, quarantined, package, bad, frame_armed, stock_frame;
 	const char *phase;
+	struct tetris_hbm_scan_snapshot scan;
 	struct tetris_hbm_frame_result frame_result;
 	u32 words[TETRIS_HBM_TIMING_WORDS - 1];
 };
@@ -1839,10 +1857,156 @@ static struct tetris_hbm_timing_record tetris_hbm_timing[TETRIS_HBM_TIMING_SLOTS
 static u32 tetris_hbm_timing_seq, tetris_hbm_timing_dropped;
 static u32 tetris_hbm_bl_request;
 static u64 tetris_hbm_bl_request_ns;
+static struct tetris_hbm_scan_context tetris_hbm_scan;
 
-static bool tetris_hbm_frame_brightness_locked(void)
+/* All scan state shares the timing lock; no panel commands run under it. */
+static void tetris_hbm_scan_expire_locked(void)
 {
-	return tetris_hbm_bl_request_ns && tetris_hbm_bl_request >= 256;
+	if (tetris_hbm_scan.expires_ns &&
+	    ktime_get_boottime_ns() >= tetris_hbm_scan.expires_ns) {
+		tetris_hbm_scan.expires_ns = 0;
+		tetris_hbm_scan.pending = false;
+		tetris_hbm_scan.cycle_open = false;
+		tetris_hbm_scan.stock_latched = false;
+	}
+}
+
+void mtk_crtc_tetris_hbm_scan_clear(struct mtk_drm_crtc *crtc)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&tetris_hbm_timing_lock, flags);
+	if (tetris_hbm_scan.crtc == crtc)
+		memset(&tetris_hbm_scan, 0, sizeof(tetris_hbm_scan));
+	spin_unlock_irqrestore(&tetris_hbm_timing_lock, flags);
+}
+
+static int tetris_hbm_scan_parse(const char *buf, size_t count,
+		bool *begin, u64 *token, enum tetris_hbm_scan_mode *mode)
+{
+	char copy[96], *cursor = copy, *word, *args[4];
+	unsigned int argc = 0;
+	int ret;
+
+	if (!count || count >= sizeof(copy) || memchr(buf, '\0', count))
+		return -EINVAL;
+	memcpy(copy, buf, count);
+	copy[count] = '\0';
+	while ((word = strsep(&cursor, " \t\r\n\f\v"))) {
+		if (!*word)
+			continue;
+		if (argc == ARRAY_SIZE(args))
+			return -EINVAL;
+		args[argc++] = word;
+	}
+	if (argc < 3 || strcmp(args[0], "scan_v1") ||
+	    strspn(args[2], "0123456789") != strlen(args[2]))
+		return -EINVAL;
+	ret = kstrtoull(args[2], 10, token);
+	if (ret)
+		return ret;
+	if (!*token)
+		return -EINVAL;
+	*begin = !strcmp(args[1], "begin");
+	*mode = TETRIS_HBM_SCAN_NONE;
+	if (*begin && argc == 4) {
+		if (!strcmp(args[3], "interactive"))
+			*mode = TETRIS_HBM_SCAN_INTERACTIVE;
+		else if (!strcmp(args[3], "ambient"))
+			*mode = TETRIS_HBM_SCAN_AMBIENT;
+		else
+			return -EINVAL;
+		return 0;
+	}
+	return !*begin && argc == 3 && !strcmp(args[1], "end") ? 0 : -EINVAL;
+}
+
+/* Caller holds crtc->lock. The protocol changes only sequencing context. */
+int mtk_crtc_tetris_hbm_scan_cmd(struct mtk_drm_crtc *crtc,
+		const char *buf, size_t count)
+{
+	struct mtk_ddp_comp *comp;
+	enum tetris_hbm_scan_mode mode;
+	unsigned long flags;
+	u64 token;
+	bool begin, hbm = false;
+	int ret = tetris_hbm_scan_parse(buf, count, &begin, &token, &mode);
+
+	if (ret)
+		return ret;
+	if (!mtk_crtc_is_tetris_vdo_panel(crtc))
+		return -EINVAL;
+	if (begin) {
+		comp = mtk_ddp_comp_request_output(crtc);
+		if (!crtc->enabled || !comp || !comp->funcs || !comp->funcs->io_cmd)
+			return -EAGAIN;
+		ret = comp->funcs->io_cmd(comp, NULL, DSI_HBM_GET_STATE, &hbm);
+		if (ret || hbm)
+			return ret ? ret : -EBUSY;
+	}
+	spin_lock_irqsave(&tetris_hbm_timing_lock, flags);
+	if (begin) {
+		/* Repeating a request must neither renew its lease nor rearm an edge. */
+		if (tetris_hbm_scan.crtc == crtc && tetris_hbm_scan.token == token) {
+			ret = -EALREADY;
+		} else {
+			tetris_hbm_scan = (struct tetris_hbm_scan_context) {
+				.crtc = crtc, .token = token, .mode = mode, .pending = true,
+				.expires_ns = ktime_get_boottime_ns() + 12000ULL * NSEC_PER_MSEC,
+			};
+		}
+	} else if (tetris_hbm_scan.crtc == crtc && tetris_hbm_scan.token == token) {
+		memset(&tetris_hbm_scan, 0, sizeof(tetris_hbm_scan));
+	}
+	spin_unlock_irqrestore(&tetris_hbm_timing_lock, flags);
+	return ret;
+}
+
+static struct tetris_hbm_scan_snapshot tetris_hbm_scan_claim_locked(
+		struct mtk_drm_crtc *crtc, bool en)
+{
+	struct tetris_hbm_scan_snapshot snapshot = {};
+
+	tetris_hbm_scan_expire_locked();
+	if (tetris_hbm_scan.crtc != crtc || !tetris_hbm_scan.expires_ns)
+		return snapshot;
+	if (en ? !tetris_hbm_scan.pending : !tetris_hbm_scan.cycle_open)
+		return snapshot;
+	snapshot.token = tetris_hbm_scan.token;
+	snapshot.expires_ns = tetris_hbm_scan.expires_ns;
+	snapshot.interactive = tetris_hbm_scan.mode == TETRIS_HBM_SCAN_INTERACTIVE &&
+		(en || tetris_hbm_scan.stock_latched);
+	tetris_hbm_scan.pending = false;
+	tetris_hbm_scan.cycle_open = en;
+	tetris_hbm_scan.stock_latched = false;
+	return snapshot;
+}
+
+/* Also consume transitions which bypass the diagnostic/stock-frame path. */
+void mtk_crtc_tetris_hbm_scan_hbm(struct mtk_drm_crtc *crtc, bool en)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&tetris_hbm_timing_lock, flags);
+	tetris_hbm_scan_claim_locked(crtc, en);
+	spin_unlock_irqrestore(&tetris_hbm_timing_lock, flags);
+}
+
+static bool tetris_hbm_scan_valid_locked(struct mtk_drm_crtc *crtc,
+		const struct tetris_hbm_scan_snapshot *snapshot)
+{
+	tetris_hbm_scan_expire_locked();
+	return snapshot->interactive && snapshot->token &&
+		tetris_hbm_scan.crtc == crtc && tetris_hbm_scan.token == snapshot->token &&
+		tetris_hbm_scan.expires_ns == snapshot->expires_ns &&
+		tetris_hbm_scan.expires_ns;
+}
+
+static bool tetris_hbm_frame_brightness_locked(struct mtk_drm_crtc *crtc,
+		const struct tetris_hbm_timing_record *rec)
+{
+	return tetris_hbm_bl_request_ns && (tetris_hbm_bl_request >= 256 ||
+		(tetris_hbm_bl_request >= 4 && tetris_hbm_scan_valid_locked(crtc, &rec->scan)));
 }
 
 static_assert(DISP_SLOT_SIZE <= 4096);
@@ -1875,6 +2039,7 @@ static void tetris_hbm_timing_reset(struct mtk_drm_crtc *crtc)
 	memset(tetris_hbm_timing, 0, sizeof(tetris_hbm_timing));
 	tetris_hbm_timing_dropped = 0;
 	tetris_hbm_bl_request_ns = 0;
+	memset(&tetris_hbm_scan, 0, sizeof(tetris_hbm_scan));
 	spin_unlock_irqrestore(&tetris_hbm_timing_lock, flags);
 }
 
@@ -1896,6 +2061,7 @@ static void tetris_hbm_timing_begin(struct mtk_drm_crtc *crtc,
 	struct mtk_drm_private *priv = crtc->base.dev->dev_private;
 	struct mtk_ddp_comp *comp;
 	struct tetris_hbm_timing_record *rec = NULL;
+	struct tetris_hbm_scan_snapshot scan = {};
 	unsigned long flags;
 	unsigned int i, slot = 0;
 	bool current_hbm = false;
@@ -1908,6 +2074,10 @@ static void tetris_hbm_timing_begin(struct mtk_drm_crtc *crtc,
 	    comp->funcs->io_cmd(comp, NULL, DSI_HBM_GET_STATE, &current_hbm) ||
 	    current_hbm == en)
 		return;
+	/* Consume before mode checks and slot allocation: one begin authorizes one ON. */
+	spin_lock_irqsave(&tetris_hbm_timing_lock, flags);
+	scan = tetris_hbm_scan_claim_locked(crtc, en);
+	spin_unlock_irqrestore(&tetris_hbm_timing_lock, flags);
 	if (!pkt || pkt->user_priv || !crtc->enabled || crtc->hbm_requested ||
 	    mtk_crtc_is_dc_mode(&crtc->base) || crtc->is_mml || crtc->is_mml_dl ||
 	    pkt->cl != crtc->gce_obj.client[CLIENT_CFG] || !crtc->gce_obj.buf.va_base ||
@@ -1935,6 +2105,7 @@ static void tetris_hbm_timing_begin(struct mtk_drm_crtc *crtc,
 	rec->crtc = crtc;
 	rec->pending = true;
 	rec->hbm = en;
+	rec->scan = scan;
 	rec->phase = "baseline";
 	rec->fps = drm_mode_vrefresh(&state->base.adjusted_mode);
 	rec->frame = state->prop_val[CRTC_PROP_PRES_FENCE_IDX];
@@ -2058,7 +2229,7 @@ static void tetris_hbm_frame_arm(struct mtk_drm_crtc *crtc,
 	    !crtc->path_data || crtc->path_data->is_discrete_path)
 		goto unlock;
 	rec->phase = "brightness-gate";
-	if (!tetris_hbm_frame_brightness_locked())
+	if (!tetris_hbm_frame_brightness_locked(crtc, rec))
 		goto unlock;
 	rec->frame_armed = true;
 	rec->phase = "armed";
@@ -2105,9 +2276,10 @@ ssize_t mtk_crtc_tetris_hbm_timing_dump(struct mtk_drm_crtc *crtc, char *buf)
 {
 	static const char * const names[] = { "eof", "planes", "mix", "done", "mutex", "end" };
 	struct tetris_hbm_timing_record snapshot[TETRIS_HBM_TIMING_SLOTS];
+	struct tetris_hbm_scan_context scan;
 	unsigned long flags;
 	u32 dropped, bl_request;
-	u64 bl_request_ns;
+	u64 bl_request_ns, scan_ms, now;
 	int i, j, len = 0;
 
 	spin_lock_irqsave(&tetris_hbm_timing_lock, flags);
@@ -2115,10 +2287,16 @@ ssize_t mtk_crtc_tetris_hbm_timing_dump(struct mtk_drm_crtc *crtc, char *buf)
 	dropped = tetris_hbm_timing_dropped;
 	bl_request = tetris_hbm_bl_request;
 	bl_request_ns = tetris_hbm_bl_request_ns;
+	tetris_hbm_scan_expire_locked();
+	scan = tetris_hbm_scan;
+	now = ktime_get_boottime_ns();
+	scan_ms = scan.expires_ns > now ? div_u64(scan.expires_ns - now, NSEC_PER_MSEC) : 0;
 	spin_unlock_irqrestore(&tetris_hbm_timing_lock, flags);
 	len += scnprintf(buf + len, PAGE_SIZE - len,
-		"version=2 timer_hz=26000000 dropped=%u bl_request=%u bl_request_ns=%llu\n",
-		dropped, bl_request, bl_request_ns);
+		"version=2 timer_hz=26000000 dropped=%u bl_request=%u bl_request_ns=%llu "
+		"scan_token=%llu scan_mode=%u scan_ms=%llu scan_pending=%u scan_latched=%u\n",
+		dropped, bl_request, bl_request_ns, scan.token, scan.mode, scan_ms,
+		scan.pending, scan.stock_latched);
 	len += tetris_dsi_queue_dump(crtc, buf + len, PAGE_SIZE - len);
 	for (i = 0; i < TETRIS_HBM_TIMING_SLOTS; i++) {
 		struct tetris_hbm_timing_record *rec = &snapshot[i];
@@ -2994,7 +3172,7 @@ static bool tetris_hbm_frame_try(struct drm_crtc *crtc, struct mtk_ddp_comp *com
 	struct tetris_hbm_timing_record *rec;
 	struct tetris_hbm_frame_result result = {};
 	unsigned long flags;
-	bool handled;
+	bool handled, low = false;
 
 	if (!pkt || !pkt->user_priv)
 		return false;
@@ -3003,7 +3181,8 @@ static bool tetris_hbm_frame_try(struct drm_crtc *crtc, struct mtk_ddp_comp *com
 	if (rec && rec->frame_armed) {
 		rec->frame_armed = false;
 		rec->phase = "brightness-gate";
-		if (tetris_hbm_frame_brightness_locked()) {
+		if (tetris_hbm_frame_brightness_locked(mtk_crtc, rec)) {
+			low = tetris_hbm_bl_request < 256;
 			result.start_ns = rec->queued_ns;
 			rec->phase = "prewait";
 		}
@@ -3018,7 +3197,10 @@ static bool tetris_hbm_frame_try(struct drm_crtc *crtc, struct mtk_ddp_comp *com
 	if (rec) {
 		rec->frame_result = result;
 		rec->stock_frame = handled;
-		rec->phase = handled ? "stock-frame" : "prewait-fallback";
+		rec->phase = handled ? (low ? "stock-frame-low" : "stock-frame") : "prewait-fallback";
+		if (en && handled && !result.cmd_error && tetris_hbm_scan.cycle_open &&
+		    tetris_hbm_scan_valid_locked(mtk_crtc, &rec->scan))
+			tetris_hbm_scan.stock_latched = true;
 	}
 	spin_unlock_irqrestore(&tetris_hbm_timing_lock, flags);
 	*error = result.cmd_error ? result.cmd_error : result.post_error;
@@ -13456,6 +13638,7 @@ void mtk_drm_crtc_disable(struct drm_crtc *crtc, bool need_wait)
 	int en = 0;
 	bool only_output = false;
 
+	mtk_crtc_tetris_hbm_scan_clear(mtk_crtc);
 	if (IS_ERR_OR_NULL(priv)) {
 		DDPPR_ERR("%s, invalid priv\n", __func__);
 		return;
