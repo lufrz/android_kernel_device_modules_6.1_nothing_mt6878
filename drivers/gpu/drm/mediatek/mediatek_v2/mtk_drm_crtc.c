@@ -1811,13 +1811,26 @@ static int tetris_dsi_queue_dump(struct mtk_drm_crtc *crtc, char *buf, size_t si
 #define TETRIS_DSI_STATE_DBG7 0x164
 #define TETRIS_HBM_TIMING_ALL ((1U << TETRIS_HBM_TIMING_COUNT) - 1)
 
+struct tetris_hbm_frame_result {
+	u64 start_ns;
+	u32 pre_us, submit_us, complete_us, post_us;
+	int pre_error, cmd_error, post_error;
+};
+
+static u32 tetris_hbm_frame_elapsed(const struct tetris_hbm_frame_result *result)
+{
+	return div_u64(ktime_get_ns() - result->start_ns, NSEC_PER_USEC);
+}
+
 struct tetris_hbm_timing_record {
 	struct cmdq_pkt *owner;
 	struct mtk_drm_crtc *crtc;
 	u32 seq, hbm, fps, frame, samples, bl_request;
 	u64 queued_ns, callback_ns, bl_request_ns;
 	int status;
-	bool pending, quarantined, package, bad;
+	bool pending, quarantined, package, bad, frame_armed, stock_frame;
+	const char *phase;
+	struct tetris_hbm_frame_result frame_result;
 	u32 words[TETRIS_HBM_TIMING_WORDS - 1];
 };
 
@@ -1826,6 +1839,11 @@ static struct tetris_hbm_timing_record tetris_hbm_timing[TETRIS_HBM_TIMING_SLOTS
 static u32 tetris_hbm_timing_seq, tetris_hbm_timing_dropped;
 static u32 tetris_hbm_bl_request;
 static u64 tetris_hbm_bl_request_ns;
+
+static bool tetris_hbm_frame_brightness_locked(void)
+{
+	return tetris_hbm_bl_request_ns && tetris_hbm_bl_request >= 256;
+}
 
 static_assert(DISP_SLOT_SIZE <= 4096);
 static_assert(DISP_SLOT_SIZE <= CMDQ_BUF_ALLOC_SIZE);
@@ -1917,6 +1935,7 @@ static void tetris_hbm_timing_begin(struct mtk_drm_crtc *crtc,
 	rec->crtc = crtc;
 	rec->pending = true;
 	rec->hbm = en;
+	rec->phase = "baseline";
 	rec->fps = drm_mode_vrefresh(&state->base.adjusted_mode);
 	rec->frame = state->prop_val[CRTC_PROP_PRES_FENCE_IDX];
 	rec->queued_ns = ktime_get_ns();
@@ -2007,6 +2026,46 @@ static void tetris_hbm_timing_package(struct mtk_drm_crtc *crtc,
 	spin_unlock_irqrestore(&tetris_hbm_timing_lock, flags);
 }
 
+/* Tag eligible transitions; no commands or panel state change at atomic_begin. */
+static void tetris_hbm_frame_arm(struct mtk_drm_crtc *crtc,
+		struct mtk_crtc_state *state, struct mtk_crtc_state *old)
+{
+	struct cmdq_pkt *pkt = state->cmdq_handle;
+	struct tetris_hbm_timing_record *rec;
+	unsigned long flags;
+
+	if (!pkt || !pkt->user_priv)
+		return;
+	spin_lock_irqsave(&tetris_hbm_timing_lock, flags);
+	rec = tetris_hbm_timing_find(crtc, pkt);
+	if (!rec)
+		goto unlock;
+	rec->phase = "mode-gate";
+	if (!old || !crtc->enabled || crtc->hbm_requested ||
+	    mtk_crtc_is_dc_mode(&crtc->base) || crtc->is_mml || crtc->is_mml_dl ||
+	    pkt->cl != crtc->gce_obj.client[CLIENT_CFG] ||
+	    !state->base.active || !old->base.active ||
+	    !state->base.enable || !old->base.enable ||
+	    drm_atomic_crtc_needs_modeset(&state->base) ||
+	    drm_mode_vrefresh(&state->base.adjusted_mode) != 120 ||
+	    drm_mode_vrefresh(&old->base.adjusted_mode) != 120 ||
+	    state->prop_val[CRTC_PROP_DISP_MODE_IDX] != old->prop_val[CRTC_PROP_DISP_MODE_IDX] ||
+	    state->prop_val[CRTC_PROP_DOZE_ACTIVE] || old->prop_val[CRTC_PROP_DOZE_ACTIVE] ||
+	    state->doze_changed || state->prop_val[CRTC_PROP_MSYNC2_0_ENABLE] ||
+	    old->prop_val[CRTC_PROP_MSYNC2_0_ENABLE] || msync2_is_on ||
+	    crtc->cur_usage != DISP_ENABLE || crtc->is_dual_pipe || crtc->sec_on ||
+	    crtc->pending_handle || crtc->skip_frame ||
+	    !crtc->path_data || crtc->path_data->is_discrete_path)
+		goto unlock;
+	rec->phase = "brightness-gate";
+	if (!tetris_hbm_frame_brightness_locked())
+		goto unlock;
+	rec->frame_armed = true;
+	rec->phase = "armed";
+ unlock:
+	spin_unlock_irqrestore(&tetris_hbm_timing_lock, flags);
+}
+
 static void tetris_hbm_timing_complete(struct mtk_drm_crtc *crtc,
 		struct cmdq_pkt *pkt, int error)
 {
@@ -2027,6 +2086,8 @@ static void tetris_hbm_timing_complete(struct mtk_drm_crtc *crtc,
 	for (i = 0; i < ARRAY_SIZE(rec->words); i++)
 		rec->words[i] = READ_ONCE(words[i]);
 	rec->callback_ns = ktime_get_ns();
+	if (rec->stock_frame)
+		expected &= ~(BIT(TETRIS_HBM_TIMING_MIX) | BIT(TETRIS_HBM_TIMING_DONE));
 	rec->status = error ? error : (rec->bad ||
 		rec->samples != expected ||
 		rec->words[0] != rec->seq || rec->words[1] != rec->seq ? -ENODATA : 0);
@@ -2056,7 +2117,7 @@ ssize_t mtk_crtc_tetris_hbm_timing_dump(struct mtk_drm_crtc *crtc, char *buf)
 	bl_request_ns = tetris_hbm_bl_request_ns;
 	spin_unlock_irqrestore(&tetris_hbm_timing_lock, flags);
 	len += scnprintf(buf + len, PAGE_SIZE - len,
-		"version=1 timer_hz=26000000 dropped=%u bl_request=%u bl_request_ns=%llu\n",
+		"version=2 timer_hz=26000000 dropped=%u bl_request=%u bl_request_ns=%llu\n",
 		dropped, bl_request, bl_request_ns);
 	len += tetris_dsi_queue_dump(crtc, buf + len, PAGE_SIZE - len);
 	for (i = 0; i < TETRIS_HBM_TIMING_SLOTS; i++) {
@@ -2064,15 +2125,37 @@ ssize_t mtk_crtc_tetris_hbm_timing_dump(struct mtk_drm_crtc *crtc, char *buf)
 
 		if (!rec->seq || rec->crtc != crtc)
 			continue;
+		/* Compact attempted-frame records retain all values within one sysfs page. */
 		len += scnprintf(buf + len, PAGE_SIZE - len,
-			"seq=%u hbm=%u fps=%u frame=%u status=%s error=%d queued_ns=%llu callback_ns=%llu bl_request=%u bl_request_ns=%llu samples=%x",
+			rec->frame_result.start_ns ?
+			"seq=%u hbm=%u fps=%u frame=%u status=%s error=%d q_ns=%llu cb_ns=%llu bl=%u bl_ns=%llu samples=%x phase=%s" :
+			"seq=%u hbm=%u fps=%u frame=%u status=%s error=%d queued_ns=%llu callback_ns=%llu bl_request=%u bl_request_ns=%llu samples=%x phase=%s",
 			rec->seq, rec->hbm, rec->fps, rec->frame,
 			rec->pending ? "pending" : (rec->status ? "error" : "complete"),
 			rec->status, rec->queued_ns, rec->callback_ns,
-			rec->bl_request, rec->bl_request_ns, rec->samples);
-		for (j = 0; j < TETRIS_HBM_TIMING_COUNT; j++)
-			len += scnprintf(buf + len, PAGE_SIZE - len, " %s_tpr=%u %s_fsm=%x",
-				names[j], rec->words[2 + j * 2], names[j], rec->words[3 + j * 2]);
+			rec->bl_request, rec->bl_request_ns, rec->samples, rec->phase);
+		if (rec->frame_result.start_ns) {
+			struct tetris_hbm_frame_result *r = &rec->frame_result;
+
+			len += scnprintf(buf + len, PAGE_SIZE - len,
+				" pre_us=%u pre_error=%d", r->pre_us, r->pre_error);
+			if (rec->stock_frame)
+				len += scnprintf(buf + len, PAGE_SIZE - len,
+					" submit_us=%u complete_us=%u post_us=%u cmd_error=%d post_error=%d",
+					r->submit_us, r->complete_us, r->post_us,
+					r->cmd_error, r->post_error);
+		}
+		for (j = 0; j < TETRIS_HBM_TIMING_COUNT; j++) {
+			if (rec->stock_frame &&
+			    (j == TETRIS_HBM_TIMING_MIX || j == TETRIS_HBM_TIMING_DONE))
+				continue;
+			if (rec->frame_result.start_ns)
+				len += scnprintf(buf + len, PAGE_SIZE - len, " %s=%u/%x",
+					names[j], rec->words[2 + j * 2], rec->words[3 + j * 2]);
+			else
+				len += scnprintf(buf + len, PAGE_SIZE - len, " %s_tpr=%u %s_fsm=%x",
+					names[j], rec->words[2 + j * 2], names[j], rec->words[3 + j * 2]);
+		}
 		len += scnprintf(buf + len, PAGE_SIZE - len, "\n");
 	}
 	return len;
@@ -2754,7 +2837,7 @@ int mtk_drm_crtc_set_panel_lhbm(struct drm_crtc *crtc, bool en)
 }
 
 static int mtk_drm_crtc_set_panel_hbm_internal(struct drm_crtc *crtc,
-		bool en, bool sync)
+		bool en, bool sync, struct tetris_hbm_frame_result *result)
 {
 	struct mtk_drm_crtc *mtk_crtc = to_mtk_crtc(crtc);
 	struct mtk_ddp_comp *comp = mtk_ddp_comp_request_output(mtk_crtc);
@@ -2850,7 +2933,11 @@ static int mtk_drm_crtc_set_panel_hbm_internal(struct drm_crtc *crtc,
 	}
 
 	/* Completion acknowledges CMDQ, not the panel's optical response. */
+	if (result)
+		result->submit_us = tetris_hbm_frame_elapsed(result);
 	ret = cmdq_pkt_flush(cmdq_handle);
+	if (result)
+		result->complete_us = tetris_hbm_frame_elapsed(result);
 destroy:
 	cmdq_pkt_destroy(cmdq_handle);
 	kfree(cb_data);
@@ -2859,7 +2946,7 @@ destroy:
 
 int mtk_drm_crtc_set_panel_hbm(struct drm_crtc *crtc, bool en)
 {
-	return mtk_drm_crtc_set_panel_hbm_internal(crtc, en, false);
+	return mtk_drm_crtc_set_panel_hbm_internal(crtc, en, false, NULL);
 }
 
 int mtk_drm_crtc_set_panel_hbm_sync(struct drm_crtc *crtc, bool en)
@@ -2871,7 +2958,7 @@ int mtk_drm_crtc_set_panel_hbm_sync(struct drm_crtc *crtc, bool en)
 
 	if (comp && comp->funcs && comp->funcs->io_cmd)
 		comp->funcs->io_cmd(comp, NULL, DSI_HBM_GET_STATE, &was_on);
-	ret = mtk_drm_crtc_set_panel_hbm_internal(crtc, en, true);
+	ret = mtk_drm_crtc_set_panel_hbm_internal(crtc, en, true, NULL);
 	if (ret)
 		tetris_dsi_queue_fail(mtk_crtc, ret);
 	else if (!en && was_on)
@@ -2880,6 +2967,65 @@ int mtk_drm_crtc_set_panel_hbm_sync(struct drm_crtc *crtc, bool en)
 	if (!ret && !en && mtk_crtc_is_tetris_vdo_panel(mtk_crtc))
 		mtk_crtc_tetris_dsi_client(mtk_crtc);
 	return ret;
+}
+
+/* False means no HBM command was constructed: same-frame fallback is safe. */
+static bool tetris_hbm_frame_sequence(struct drm_crtc *crtc,
+		struct mtk_ddp_comp *comp, bool en, struct tetris_hbm_frame_result *result)
+{
+	result->pre_error = comp->funcs->io_cmd(comp, NULL, DSI_HBM_WAIT, NULL);
+	result->pre_us = tetris_hbm_frame_elapsed(result);
+	if (result->pre_error)
+		return false;
+
+	/* Use the sysfs synchronous path and CLIENT_CFG to serialize DSI writers. */
+	result->cmd_error = mtk_drm_crtc_set_panel_hbm_internal(crtc, en, true, result);
+	/*
+	 * The synchronous flush has completed; let the mask follow without another
+	 * FRAME_DONE wait. CMDQ completion does not imply optical readiness.
+	 */
+	return true;
+}
+
+static bool tetris_hbm_frame_try(struct drm_crtc *crtc, struct mtk_ddp_comp *comp,
+		struct cmdq_pkt *pkt, bool en, int *error)
+{
+	struct mtk_drm_crtc *mtk_crtc = to_mtk_crtc(crtc);
+	struct tetris_hbm_timing_record *rec;
+	struct tetris_hbm_frame_result result = {};
+	unsigned long flags;
+	bool handled;
+
+	if (!pkt || !pkt->user_priv)
+		return false;
+	spin_lock_irqsave(&tetris_hbm_timing_lock, flags);
+	rec = tetris_hbm_timing_find(mtk_crtc, pkt);
+	if (rec && rec->frame_armed) {
+		rec->frame_armed = false;
+		rec->phase = "brightness-gate";
+		if (tetris_hbm_frame_brightness_locked()) {
+			result.start_ns = rec->queued_ns;
+			rec->phase = "prewait";
+		}
+	}
+	spin_unlock_irqrestore(&tetris_hbm_timing_lock, flags);
+	if (!result.start_ns)
+		return false;
+
+	handled = tetris_hbm_frame_sequence(crtc, comp, en, &result);
+	spin_lock_irqsave(&tetris_hbm_timing_lock, flags);
+	rec = tetris_hbm_timing_find(mtk_crtc, pkt);
+	if (rec) {
+		rec->frame_result = result;
+		rec->stock_frame = handled;
+		rec->phase = handled ? "stock-frame" : "prewait-fallback";
+	}
+	spin_unlock_irqrestore(&tetris_hbm_timing_lock, flags);
+	*error = result.cmd_error ? result.cmd_error : result.post_error;
+	/* Atomic flush uses EOPNOTSUPP to select a different HBM path. */
+	if (handled && *error == -EOPNOTSUPP)
+		*error = -EIO;
+	return handled;
 }
 
 int mtk_drm_crtc_hbm_wait(struct drm_crtc *crtc, bool en)
@@ -14890,6 +15036,9 @@ static void mtk_drm_crtc_atomic_begin(struct drm_crtc *crtc,
 		comp && mtk_ddp_comp_get_type(comp->id) == MTK_DISP_WDMA)
 		goto end;
 
+	/* All common configuration is complete; only tag the eligible transition. */
+	tetris_hbm_frame_arm(mtk_crtc, mtk_crtc_state, old_mtk_state);
+
 	for_each_comp_in_cur_crtc_path(comp, mtk_crtc, i, j) {
 		comp->qos_bw = 0;
 		comp->qos_bw_other = 0;
@@ -16984,7 +17133,9 @@ static int mtk_crtc_queue_tetris_hbm(struct drm_crtc *crtc,
 		return ret == -EOPNOTSUPP ? -EIO : ret;
 
 	mtk_crtc_tetris_hbm_timing_sample(mtk_crtc, handle, TETRIS_HBM_TIMING_PLANES);
-	/* Queue HBM in the same EOF/planes/mutex packet. */
+	if (tetris_hbm_frame_try(crtc, comp, handle, en, &ret))
+		return ret;
+	/* Remaining paths retain HBM in the same EOF/planes/mutex packet. */
 	tetris_hbm_timing_package(mtk_crtc, handle, true);
 	mtk_drm_trace_begin("DSI_HBM_FRAME: %d", en);
 	ret = comp->funcs->io_cmd(comp, handle, DSI_HBM_SET, &en);
