@@ -1788,6 +1788,296 @@ struct cmdq_client *mtk_crtc_tetris_dsi_client(struct mtk_drm_crtc *crtc)
 		CLIENT_CFG : CLIENT_DSI_CFG];
 }
 
+static int tetris_dsi_queue_dump(struct mtk_drm_crtc *crtc, char *buf, size_t size)
+{
+	unsigned long flags;
+	int len;
+
+	spin_lock_irqsave(&tetris_dsi_queue_lock, flags);
+	len = scnprintf(buf, size,
+		"dsi_queue=%s dsi_release_ready=%u dsi_generation=%llu "
+		"dsi_acquires=%u dsi_releases=%u dsi_error=%d\n",
+		tetris_dsi_queue.crtc == crtc && tetris_dsi_queue.owned ? "cfg" : "dsi",
+		tetris_dsi_queue.release_ready, tetris_dsi_queue.generation,
+		tetris_dsi_queue.acquires, tetris_dsi_queue.releases, tetris_dsi_queue.error);
+	spin_unlock_irqrestore(&tetris_dsi_queue_lock, flags);
+	return len;
+}
+
+/* Passive, bounded diagnostics. No public structure or command-queue ABI changes. */
+#define TETRIS_HBM_TIMING_SLOTS 8
+#define TETRIS_HBM_TIMING_WORDS 15
+#define TETRIS_HBM_TIMING_BYTES (TETRIS_HBM_TIMING_WORDS * sizeof(u32))
+#define TETRIS_DSI_STATE_DBG7 0x164
+#define TETRIS_HBM_TIMING_ALL ((1U << TETRIS_HBM_TIMING_COUNT) - 1)
+
+struct tetris_hbm_timing_record {
+	struct cmdq_pkt *owner;
+	struct mtk_drm_crtc *crtc;
+	u32 seq, hbm, fps, frame, samples, bl_request;
+	u64 queued_ns, callback_ns, bl_request_ns;
+	int status;
+	bool pending, quarantined, package, bad;
+	u32 words[TETRIS_HBM_TIMING_WORDS - 1];
+};
+
+static DEFINE_SPINLOCK(tetris_hbm_timing_lock);
+static struct tetris_hbm_timing_record tetris_hbm_timing[TETRIS_HBM_TIMING_SLOTS];
+static u32 tetris_hbm_timing_seq, tetris_hbm_timing_dropped;
+static u32 tetris_hbm_bl_request;
+static u64 tetris_hbm_bl_request_ns;
+
+static_assert(DISP_SLOT_SIZE <= 4096);
+static_assert(DISP_SLOT_SIZE <= CMDQ_BUF_ALLOC_SIZE);
+
+/* The existing CMDQ user_priv is unused on this non-MML display path. */
+static struct tetris_hbm_timing_record *tetris_hbm_timing_find(
+		struct mtk_drm_crtc *crtc, struct cmdq_pkt *pkt)
+{
+	unsigned long cookie = (unsigned long)pkt->user_priv;
+	unsigned int slot = cookie & 15;
+	struct tetris_hbm_timing_record *rec;
+
+	if (!slot || slot > TETRIS_HBM_TIMING_SLOTS)
+		return NULL;
+	rec = &tetris_hbm_timing[slot - 1];
+	if (!rec->pending || rec->quarantined || rec->owner != pkt ||
+	    rec->crtc != crtc || rec->seq != (u32)(cookie >> 4))
+		return NULL;
+	return rec;
+}
+
+static void tetris_hbm_timing_reset(struct mtk_drm_crtc *crtc)
+{
+	unsigned long flags;
+
+	if (drm_crtc_index(&crtc->base) != 0)
+		return;
+	spin_lock_irqsave(&tetris_hbm_timing_lock, flags);
+	memset(tetris_hbm_timing, 0, sizeof(tetris_hbm_timing));
+	tetris_hbm_timing_dropped = 0;
+	tetris_hbm_bl_request_ns = 0;
+	spin_unlock_irqrestore(&tetris_hbm_timing_lock, flags);
+}
+
+static void tetris_hbm_timing_note_bl(struct mtk_drm_crtc *crtc, u32 level)
+{
+	unsigned long flags;
+
+	if (!mtk_crtc_is_tetris_vdo_panel(crtc))
+		return;
+	spin_lock_irqsave(&tetris_hbm_timing_lock, flags);
+	tetris_hbm_bl_request = level;
+	tetris_hbm_bl_request_ns = ktime_get_ns();
+	spin_unlock_irqrestore(&tetris_hbm_timing_lock, flags);
+}
+
+static void tetris_hbm_timing_begin(struct mtk_drm_crtc *crtc,
+		struct cmdq_pkt *pkt, struct mtk_crtc_state *state)
+{
+	struct mtk_drm_private *priv = crtc->base.dev->dev_private;
+	struct mtk_ddp_comp *comp;
+	struct tetris_hbm_timing_record *rec = NULL;
+	unsigned long flags;
+	unsigned int i, slot = 0;
+	bool current_hbm = false;
+	bool en = state->prop_val[CRTC_PROP_HBM_ENABLE];
+
+	if (!mtk_crtc_is_tetris_vdo_panel(crtc))
+		return;
+	comp = mtk_ddp_comp_request_output(crtc);
+	if (!comp || !comp->funcs || !comp->funcs->io_cmd ||
+	    comp->funcs->io_cmd(comp, NULL, DSI_HBM_GET_STATE, &current_hbm) ||
+	    current_hbm == en)
+		return;
+	if (!pkt || pkt->user_priv || !crtc->enabled || crtc->hbm_requested ||
+	    mtk_crtc_is_dc_mode(&crtc->base) || crtc->is_mml || crtc->is_mml_dl ||
+	    pkt->cl != crtc->gce_obj.client[CLIENT_CFG] || !crtc->gce_obj.buf.va_base ||
+	    !mtk_drm_helper_get_opt(priv->helper_opt, MTK_DRM_OPT_HBM))
+		return;
+
+	spin_lock_irqsave(&tetris_hbm_timing_lock, flags);
+	for (i = 0; i < TETRIS_HBM_TIMING_SLOTS; i++) {
+		if (!tetris_hbm_timing[i].pending && !tetris_hbm_timing[i].quarantined &&
+		    (!rec || tetris_hbm_timing[i].queued_ns < rec->queued_ns)) {
+			rec = &tetris_hbm_timing[i];
+			slot = i;
+		}
+	}
+	if (!rec) {
+		tetris_hbm_timing_dropped++;
+		spin_unlock_irqrestore(&tetris_hbm_timing_lock, flags);
+		return;
+	}
+	memset(rec, 0, sizeof(*rec));
+	if (!++tetris_hbm_timing_seq)
+		++tetris_hbm_timing_seq;
+	rec->seq = tetris_hbm_timing_seq;
+	rec->owner = pkt;
+	rec->crtc = crtc;
+	rec->pending = true;
+	rec->hbm = en;
+	rec->fps = drm_mode_vrefresh(&state->base.adjusted_mode);
+	rec->frame = state->prop_val[CRTC_PROP_PRES_FENCE_IDX];
+	rec->queued_ns = ktime_get_ns();
+	rec->bl_request = tetris_hbm_bl_request;
+	rec->bl_request_ns = tetris_hbm_bl_request_ns;
+	memset(mtk_get_gce_backup_slot_va(crtc,
+		DISP_SLOT_TETRIS_HBM_TIMING(slot)), 0, TETRIS_HBM_TIMING_BYTES);
+	pkt->user_priv = (void *)(((unsigned long)rec->seq << 4) | (slot + 1));
+	spin_unlock_irqrestore(&tetris_hbm_timing_lock, flags);
+}
+
+void mtk_crtc_tetris_hbm_timing_sample(struct mtk_drm_crtc *crtc,
+		struct cmdq_pkt *pkt, enum tetris_hbm_timing_point point)
+{
+	struct tetris_hbm_timing_record *rec;
+	struct mtk_ddp_comp *comp;
+	unsigned long flags;
+	dma_addr_t base;
+	size_t old_size, old_avail;
+	u32 old_high;
+	unsigned int slot;
+	int ret = 0;
+
+	if (!pkt || !pkt->user_priv || point >= TETRIS_HBM_TIMING_COUNT)
+		return;
+	spin_lock_irqsave(&tetris_hbm_timing_lock, flags);
+	rec = tetris_hbm_timing_find(crtc, pkt);
+	if (!rec || rec->bad || (rec->samples & BIT(point)) ||
+	    ((point == TETRIS_HBM_TIMING_MIX || point == TETRIS_HBM_TIMING_DONE) &&
+	     !rec->package))
+		goto unlock;
+	/* Leave headroom: a sample uses at most 12 instructions, no allocation. */
+	if (pkt->avail_buf_size < 128) {
+		rec->bad = true;
+		goto unlock;
+	}
+	comp = mtk_ddp_comp_request_output(crtc);
+	if (!comp || comp->id != DDP_COMPONENT_DSI0) {
+		rec->bad = true;
+		goto unlock;
+	}
+	slot = rec - tetris_hbm_timing;
+	base = mtk_get_gce_backup_slot_pa(crtc, DISP_SLOT_TETRIS_HBM_TIMING(slot));
+	old_size = pkt->cmd_buf_size;
+	old_avail = pkt->avail_buf_size;
+	old_high = pkt->write_addr_high;
+	if (point == TETRIS_HBM_TIMING_EOF)
+		ret = cmdq_pkt_write(pkt, NULL, base, rec->seq, ~0);
+	if (!ret)
+		ret = cmdq_pkt_write_indriect(pkt, NULL, base + (2 + point * 2) * 4,
+			CMDQ_TPR_ID, ~0);
+	/* Preserve the caller's SPR3 across the observational MMIO read. */
+	if (!ret)
+		ret = cmdq_pkt_write_indriect(pkt, NULL, base + 14 * 4,
+			CMDQ_THR_SPR_IDX3, ~0);
+	if (!ret)
+		ret = cmdq_pkt_mem_move(pkt, NULL, comp->regs_pa + TETRIS_DSI_STATE_DBG7,
+			base + (3 + point * 2) * 4, CMDQ_THR_SPR_IDX3);
+	if (!ret)
+		ret = cmdq_pkt_read_addr(pkt, base + 14 * 4, CMDQ_THR_SPR_IDX3);
+	if (!ret && point == TETRIS_HBM_TIMING_END)
+		ret = cmdq_pkt_write(pkt, NULL, base + 4, rec->seq, ~0);
+	if (ret) {
+		/* No new buffer can have been allocated with the headroom above. */
+		pkt->cmd_buf_size = old_size;
+		pkt->avail_buf_size = old_avail;
+		pkt->write_addr_high = old_high;
+		rec->bad = true;
+	} else {
+		rec->samples |= BIT(point);
+	}
+ unlock:
+	spin_unlock_irqrestore(&tetris_hbm_timing_lock, flags);
+}
+
+static void tetris_hbm_timing_package(struct mtk_drm_crtc *crtc,
+		struct cmdq_pkt *pkt, bool active)
+{
+	struct tetris_hbm_timing_record *rec;
+	unsigned long flags;
+
+	if (!pkt || !pkt->user_priv)
+		return;
+	spin_lock_irqsave(&tetris_hbm_timing_lock, flags);
+	rec = tetris_hbm_timing_find(crtc, pkt);
+	if (rec)
+		rec->package = active;
+	spin_unlock_irqrestore(&tetris_hbm_timing_lock, flags);
+}
+
+static void tetris_hbm_timing_complete(struct mtk_drm_crtc *crtc,
+		struct cmdq_pkt *pkt, int error)
+{
+	struct tetris_hbm_timing_record *rec;
+	unsigned long flags;
+	unsigned int slot, i;
+	u32 *words, expected = TETRIS_HBM_TIMING_ALL;
+
+	if (!pkt || !pkt->user_priv)
+		return;
+	spin_lock_irqsave(&tetris_hbm_timing_lock, flags);
+	rec = tetris_hbm_timing_find(crtc, pkt);
+	if (!rec)
+		goto unlock;
+	slot = rec - tetris_hbm_timing;
+	words = mtk_get_gce_backup_slot_va(crtc, DISP_SLOT_TETRIS_HBM_TIMING(slot));
+	dma_rmb();
+	for (i = 0; i < ARRAY_SIZE(rec->words); i++)
+		rec->words[i] = READ_ONCE(words[i]);
+	rec->callback_ns = ktime_get_ns();
+	rec->status = error ? error : (rec->bad ||
+		rec->samples != expected ||
+		rec->words[0] != rec->seq || rec->words[1] != rec->seq ? -ENODATA : 0);
+	/* Incomplete/error packets may still own DMA: never recycle their slot. */
+	rec->quarantined = rec->status != 0;
+	rec->pending = false;
+	rec->package = false;
+	rec->owner = NULL;
+	pkt->user_priv = NULL;
+ unlock:
+	spin_unlock_irqrestore(&tetris_hbm_timing_lock, flags);
+}
+
+ssize_t mtk_crtc_tetris_hbm_timing_dump(struct mtk_drm_crtc *crtc, char *buf)
+{
+	static const char * const names[] = { "eof", "planes", "mix", "done", "mutex", "end" };
+	struct tetris_hbm_timing_record snapshot[TETRIS_HBM_TIMING_SLOTS];
+	unsigned long flags;
+	u32 dropped, bl_request;
+	u64 bl_request_ns;
+	int i, j, len = 0;
+
+	spin_lock_irqsave(&tetris_hbm_timing_lock, flags);
+	memcpy(snapshot, tetris_hbm_timing, sizeof(snapshot));
+	dropped = tetris_hbm_timing_dropped;
+	bl_request = tetris_hbm_bl_request;
+	bl_request_ns = tetris_hbm_bl_request_ns;
+	spin_unlock_irqrestore(&tetris_hbm_timing_lock, flags);
+	len += scnprintf(buf + len, PAGE_SIZE - len,
+		"version=1 timer_hz=26000000 dropped=%u bl_request=%u bl_request_ns=%llu\n",
+		dropped, bl_request, bl_request_ns);
+	len += tetris_dsi_queue_dump(crtc, buf + len, PAGE_SIZE - len);
+	for (i = 0; i < TETRIS_HBM_TIMING_SLOTS; i++) {
+		struct tetris_hbm_timing_record *rec = &snapshot[i];
+
+		if (!rec->seq || rec->crtc != crtc)
+			continue;
+		len += scnprintf(buf + len, PAGE_SIZE - len,
+			"seq=%u hbm=%u fps=%u frame=%u status=%s error=%d queued_ns=%llu callback_ns=%llu bl_request=%u bl_request_ns=%llu samples=%x",
+			rec->seq, rec->hbm, rec->fps, rec->frame,
+			rec->pending ? "pending" : (rec->status ? "error" : "complete"),
+			rec->status, rec->queued_ns, rec->callback_ns,
+			rec->bl_request, rec->bl_request_ns, rec->samples);
+		for (j = 0; j < TETRIS_HBM_TIMING_COUNT; j++)
+			len += scnprintf(buf + len, PAGE_SIZE - len, " %s_tpr=%u %s_fsm=%x",
+				names[j], rec->words[2 + j * 2], names[j], rec->words[3 + j * 2]);
+		len += scnprintf(buf + len, PAGE_SIZE - len, "\n");
+	}
+	return len;
+}
+
 int mtk_drm_setbacklight(struct drm_crtc *crtc, unsigned int level,
 	unsigned int panel_ext_param, unsigned int cfg_flag, unsigned int lock)
 {
@@ -1848,6 +2138,7 @@ int mtk_drm_setbacklight(struct drm_crtc *crtc, unsigned int level,
 		return -EINVAL;
 	}
 
+	tetris_hbm_timing_note_bl(mtk_crtc, level);
 	mtk_drm_idlemgr_kick(__func__, crtc, 0);
 
 	cb_data = kmalloc(sizeof(*cb_data), GFP_KERNEL);
@@ -8470,6 +8761,7 @@ static void ddp_cmdq_cb(struct cmdq_cb_data data)
 	DDPINFO("%s +\n", __func__);
 
 	tetris_dsi_queue_complete(to_mtk_crtc(crtc), cb_data->cmdq_handle, data.err);
+	tetris_hbm_timing_complete(to_mtk_crtc(crtc), cb_data->cmdq_handle, data.err);
 	mtk_disp_signal_fence_worker_signal(crtc, data);
 	DDPINFO("%s -\n", __func__);
 }
@@ -13420,6 +13712,8 @@ struct cmdq_pkt *mtk_crtc_gce_commit_begin(struct drm_crtc *crtc,
 		mtk_crtc_wait_frame_done(mtk_crtc, cmdq_handle, DDP_FIRST_PATH, 0);
 	}
 
+	tetris_hbm_timing_begin(mtk_crtc, cmdq_handle, crtc_state);
+	mtk_crtc_tetris_hbm_timing_sample(mtk_crtc, cmdq_handle, TETRIS_HBM_TIMING_EOF);
 
 	/* Record Vblank start timestamp */
 	mtk_vblank_config_rec_start(mtk_crtc, cmdq_handle, FRAME_CONFIG);
@@ -15649,6 +15943,7 @@ int mtk_crtc_gce_flush(struct drm_crtc *crtc, void *gce_cb,
 		/* DL without trigger loop */
 		mtk_disp_mutex_enable_cmdq(mtk_crtc->mutex[0],
 			cmdq_handle, mtk_crtc->gce_obj.base);
+		mtk_crtc_tetris_hbm_timing_sample(mtk_crtc, cmdq_handle, TETRIS_HBM_TIMING_MUTEX);
 	}
 
 	if (mtk_crtc_is_dc_mode(crtc) ||
@@ -15693,6 +15988,7 @@ int mtk_crtc_gce_flush(struct drm_crtc *crtc, void *gce_cb,
 
 	/* Record Vblank end timestamp and calculate duration */
 	mtk_vblank_config_rec_end_cal(mtk_crtc, cmdq_handle, FRAME_CONFIG);
+	mtk_crtc_tetris_hbm_timing_sample(mtk_crtc, cmdq_handle, TETRIS_HBM_TIMING_END);
 
 	if (cmdq_pkt_flush_async(cmdq_handle, gce_cb, cb_data) < 0)
 		DDPPR_ERR("failed to flush gce_cb async\n");
@@ -16687,9 +16983,12 @@ static int mtk_crtc_queue_tetris_hbm(struct drm_crtc *crtc,
 	if (ret)
 		return ret == -EOPNOTSUPP ? -EIO : ret;
 
+	mtk_crtc_tetris_hbm_timing_sample(mtk_crtc, handle, TETRIS_HBM_TIMING_PLANES);
 	/* Queue HBM in the same EOF/planes/mutex packet. */
+	tetris_hbm_timing_package(mtk_crtc, handle, true);
 	mtk_drm_trace_begin("DSI_HBM_FRAME: %d", en);
 	ret = comp->funcs->io_cmd(comp, handle, DSI_HBM_SET, &en);
+	tetris_hbm_timing_package(mtk_crtc, handle, false);
 	mtk_drm_trace_end("DSI_HBM_FRAME: %d", en);
 	if (ret < 0)
 		return ret;
@@ -17579,6 +17878,7 @@ static void mtk_crtc_init_gce_obj(struct drm_device *drm_dev,
 	}
 
 	memset(cmdq_buf->va_base, 0, DISP_SLOT_SIZE);
+	tetris_hbm_timing_reset(mtk_crtc);
 
 	/* support DC with color matrix config no more */
 	/* mtk_crtc_init_color_matrix_data_slot(mtk_crtc); */
