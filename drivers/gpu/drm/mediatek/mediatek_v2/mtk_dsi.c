@@ -10232,6 +10232,11 @@ static void mtk_dsi_vdo_timing_change(struct mtk_dsi *dsi,
 	fps_chg_index = mtk_crtc->mode_change_index;
 	mtk_drm_idlemgr_kick(__func__, &(mtk_crtc->base), 0);
 
+	/* VFP and brightness follow the same ordered DSI ownership. */
+	if (mtk_crtc_is_tetris_vdo_panel(mtk_crtc) &&
+	    (fps_chg_index & MODE_DSI_VFP) && !(fps_chg_index & MODE_DSI_HFP))
+		client = mtk_crtc_tetris_dsi_client(mtk_crtc);
+
 	cb_data = kmalloc(sizeof(*cb_data), GFP_KERNEL);
 	if (!cb_data) {
 		DDPINFO("%s:%d, cb data creation failed\n",
@@ -11268,6 +11273,9 @@ static int mtk_dsi_io_cmd(struct mtk_ddp_comp *comp, struct cmdq_pkt *handle,
 		struct mtk_panel_params *params_config = NULL;
 		struct mtk_dsi *dsi =
 			container_of(comp, struct mtk_dsi, ddp_comp);
+		ret = mtk_crtc_tetris_dsi_hbm_begin(crtc);
+		if (ret)
+			return ret == -EOPNOTSUPP ? -EIO : ret;
 		panel_ext = mtk_dsi_get_panel_ext(comp);
 		if (dsi->ext && dsi->ext->params)
 			params_config = crtc->panel_ext->params;

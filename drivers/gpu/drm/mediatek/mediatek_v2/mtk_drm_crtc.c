@@ -39,6 +39,7 @@
 #include "mtk_drm_crtc.h"
 #include "mtk_drm_ddp.h"
 #include "mtk_drm_ddp_comp.h"
+#include "mtk_dsi.h"
 #include "mtk_drm_gem.h"
 #include "mtk_drm_plane.h"
 #include "mtk_writeback.h"
@@ -1539,10 +1540,14 @@ void mtk_crtc_v_idle_apsrc_control(struct drm_crtc *crtc,
 			reset, condition_check, crtc_id, enable);
 }
 
+static void tetris_dsi_queue_complete(struct mtk_drm_crtc *crtc,
+		struct cmdq_pkt *pkt, int error);
+
 static void bl_cmdq_cb(struct cmdq_cb_data data)
 {
 	struct mtk_cmdq_cb_data *cb_data = data.data;
 
+	tetris_dsi_queue_complete(to_mtk_crtc(cb_data->crtc), cb_data->cmdq_handle, data.err);
 	CRTC_MMP_MARK(0, backlight, 0xffffffff, 0);
 
 	cmdq_pkt_destroy(cb_data->cmdq_handle);
@@ -1573,6 +1578,216 @@ bool msync_is_on(struct mtk_drm_private *priv,
 	return false;
 }
 
+/* Restrict the DSI queue handoff to Tetris's mixed-mode Samsung panel. */
+bool mtk_crtc_is_tetris_vdo_panel(struct mtk_drm_crtc *mtk_crtc)
+{
+	struct drm_crtc *crtc;
+	struct mtk_drm_private *priv;
+	struct mtk_ddp_comp *comp;
+	struct mtk_dsi *dsi;
+
+	if (!mtk_crtc)
+		return false;
+
+	crtc = &mtk_crtc->base;
+	priv = crtc->dev->dev_private;
+	if (drm_crtc_index(crtc) != 0 ||
+	    priv->data->mmsys_id != MMSYS_MT6878 ||
+	    mtk_crtc_is_frame_trigger_mode(crtc))
+		return false;
+
+	comp = mtk_ddp_comp_request_output(mtk_crtc);
+	if (!comp || comp->id != DDP_COMPONENT_DSI0)
+		return false;
+
+	dsi = container_of(comp, struct mtk_dsi, ddp_comp);
+	return !dsi->is_slave && dsi->panel && dsi->panel->dev &&
+		of_device_is_compatible(dsi->panel->dev->of_node,
+					"samsung,s6e8fc3x02") &&
+		dsi->ext && dsi->ext->params &&
+		dsi->ext->params->vdo_mix_mode_en;
+}
+
+/*
+ * Normal brightness uses DSI_CFG; HBM and its mask use CFG. All submitters
+ * hold crtc.lock. The callback only acknowledges a specific OFF packet and
+ * never changes routing. Hardware drains preserve order across the FIFOs;
+ * a software scan lease or the panel's cached HBM bit is not a completion.
+ * Keep this state private: other vendor modules share struct mtk_drm_crtc.
+ */
+static DEFINE_SPINLOCK(tetris_dsi_queue_lock);
+static struct {
+	struct mtk_drm_crtc *crtc;
+	struct cmdq_pkt *release_pkt;
+	bool owned, release_ready;
+	u64 generation;
+	u32 acquires, releases;
+	int error;
+} tetris_dsi_queue;
+
+static bool tetris_dsi_queue_owned(struct mtk_drm_crtc *crtc)
+{
+	unsigned long flags;
+	bool owned;
+
+	spin_lock_irqsave(&tetris_dsi_queue_lock, flags);
+	owned = tetris_dsi_queue.crtc == crtc && tetris_dsi_queue.owned;
+	spin_unlock_irqrestore(&tetris_dsi_queue_lock, flags);
+	return owned;
+}
+
+static int tetris_dsi_queue_drain(struct mtk_drm_crtc *crtc, int client)
+{
+	struct cmdq_pkt *pkt;
+	int ret;
+
+	if (!crtc->gce_obj.client[client])
+		return -ENODEV;
+	pkt = cmdq_pkt_create(crtc->gce_obj.client[client]);
+	if (IS_ERR_OR_NULL(pkt))
+		return pkt ? PTR_ERR(pkt) : -ENOMEM;
+	/* Lowest priority must not overtake any earlier command in this FIFO. */
+	pkt->priority = 0;
+	ret = cmdq_pkt_flush(pkt);
+	cmdq_pkt_destroy(pkt);
+	return ret;
+}
+
+static int tetris_dsi_queue_acquire(struct mtk_drm_crtc *crtc)
+{
+	unsigned long flags;
+	int ret = 0;
+
+	if (!mtk_crtc_is_tetris_vdo_panel(crtc) || tetris_dsi_queue_owned(crtc))
+		return 0;
+	if (!crtc->enabled)
+		return -EAGAIN;
+	if (crtc->gce_obj.client[CLIENT_DSI_CFG])
+		ret = tetris_dsi_queue_drain(crtc, CLIENT_DSI_CFG);
+	spin_lock_irqsave(&tetris_dsi_queue_lock, flags);
+	if (!ret) {
+		tetris_dsi_queue.crtc = crtc;
+		tetris_dsi_queue.owned = true;
+		/* No HBM command has been constructed yet. */
+		tetris_dsi_queue.release_ready = true;
+		tetris_dsi_queue.release_pkt = NULL;
+		tetris_dsi_queue.generation++;
+		tetris_dsi_queue.acquires++;
+	}
+	tetris_dsi_queue.error = ret;
+	spin_unlock_irqrestore(&tetris_dsi_queue_lock, flags);
+	return ret;
+}
+
+/* Called before constructing an actual HBM transition, including fallback. */
+int mtk_crtc_tetris_dsi_hbm_begin(struct mtk_drm_crtc *crtc)
+{
+	unsigned long flags;
+	int ret;
+
+	if (!mtk_crtc_is_tetris_vdo_panel(crtc))
+		return 0;
+	ret = tetris_dsi_queue_acquire(crtc);
+	if (ret)
+		return ret;
+	spin_lock_irqsave(&tetris_dsi_queue_lock, flags);
+	tetris_dsi_queue.generation++;
+	tetris_dsi_queue.release_ready = false;
+	tetris_dsi_queue.release_pkt = NULL;
+	spin_unlock_irqrestore(&tetris_dsi_queue_lock, flags);
+	return 0;
+}
+
+static void tetris_dsi_queue_arm_release(struct mtk_drm_crtc *crtc,
+		struct cmdq_pkt *pkt)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&tetris_dsi_queue_lock, flags);
+	if (tetris_dsi_queue.crtc == crtc && tetris_dsi_queue.owned) {
+		tetris_dsi_queue.release_pkt = pkt;
+		tetris_dsi_queue.release_ready = false;
+	}
+	spin_unlock_irqrestore(&tetris_dsi_queue_lock, flags);
+}
+
+static void tetris_dsi_queue_complete(struct mtk_drm_crtc *crtc,
+		struct cmdq_pkt *pkt, int error)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&tetris_dsi_queue_lock, flags);
+	if (tetris_dsi_queue.crtc == crtc && tetris_dsi_queue.owned &&
+	    pkt && tetris_dsi_queue.release_pkt == pkt) {
+		tetris_dsi_queue.release_pkt = NULL;
+		tetris_dsi_queue.release_ready = !error;
+		tetris_dsi_queue.error = error;
+	}
+	spin_unlock_irqrestore(&tetris_dsi_queue_lock, flags);
+}
+
+/* A failed submission may have already invoked its callback. Revoke both. */
+static void tetris_dsi_queue_fail(struct mtk_drm_crtc *crtc, int error)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&tetris_dsi_queue_lock, flags);
+	if (tetris_dsi_queue.crtc == crtc && tetris_dsi_queue.owned) {
+		tetris_dsi_queue.release_pkt = NULL;
+		tetris_dsi_queue.release_ready = false;
+		tetris_dsi_queue.error = error;
+	}
+	spin_unlock_irqrestore(&tetris_dsi_queue_lock, flags);
+}
+
+static void tetris_dsi_queue_sync_off(struct mtk_drm_crtc *crtc)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&tetris_dsi_queue_lock, flags);
+	if (tetris_dsi_queue.crtc == crtc && tetris_dsi_queue.owned) {
+		tetris_dsi_queue.release_pkt = NULL;
+		tetris_dsi_queue.release_ready = true;
+		tetris_dsi_queue.error = 0;
+	}
+	spin_unlock_irqrestore(&tetris_dsi_queue_lock, flags);
+}
+
+/* Called with crtc.lock held, after the display has been kicked out of idle. */
+struct cmdq_client *mtk_crtc_tetris_dsi_client(struct mtk_drm_crtc *crtc)
+{
+	unsigned long flags;
+	bool owned, ready;
+	u64 generation;
+	int ret;
+
+	if (!mtk_crtc_is_tetris_vdo_panel(crtc))
+		return crtc->gce_obj.client[CLIENT_DSI_CFG];
+	spin_lock_irqsave(&tetris_dsi_queue_lock, flags);
+	owned = tetris_dsi_queue.crtc == crtc && tetris_dsi_queue.owned;
+	ready = owned && tetris_dsi_queue.release_ready;
+	generation = tetris_dsi_queue.generation;
+	spin_unlock_irqrestore(&tetris_dsi_queue_lock, flags);
+	if (ready && crtc->enabled) {
+		/* Also covers brightness/VFP jobs queued after the acknowledged OFF. */
+		ret = tetris_dsi_queue_drain(crtc, CLIENT_CFG);
+		spin_lock_irqsave(&tetris_dsi_queue_lock, flags);
+		if (tetris_dsi_queue.generation == generation &&
+		    tetris_dsi_queue.release_ready) {
+			tetris_dsi_queue.error = ret;
+			if (!ret) {
+				tetris_dsi_queue.owned = false;
+				tetris_dsi_queue.release_ready = false;
+				tetris_dsi_queue.releases++;
+				owned = false;
+			}
+		}
+		spin_unlock_irqrestore(&tetris_dsi_queue_lock, flags);
+	}
+	return crtc->gce_obj.client[owned || !crtc->gce_obj.client[CLIENT_DSI_CFG] ?
+		CLIENT_CFG : CLIENT_DSI_CFG];
+}
+
 int mtk_drm_setbacklight(struct drm_crtc *crtc, unsigned int level,
 	unsigned int panel_ext_param, unsigned int cfg_flag, unsigned int lock)
 {
@@ -1584,7 +1799,7 @@ int mtk_drm_setbacklight(struct drm_crtc *crtc, unsigned int level,
 	struct mtk_cmdq_cb_data *cb_data;
 	struct mtk_bl_ext_config bl_ext_config;
 	static unsigned int bl_cnt;
-	bool is_frame_mode;
+	bool is_frame_mode, temporary_cfg = false;
 	int index = drm_crtc_index(crtc);
 	int ret = 0;
 	struct mtk_drm_private *priv = crtc->dev->dev_private;
@@ -1649,6 +1864,16 @@ int mtk_drm_setbacklight(struct drm_crtc *crtc, unsigned int level,
 	/* SILKY BRIGHTNESS control flow only support CRTC0 */
 	if (index == 0 && pq_data && pq_data->new_persist_property[DISP_PQ_CCORR_SILKY_BRIGHTNESS] &&
 		sb_cmdq_handle != NULL) {
+		if (mtk_crtc_is_tetris_vdo_panel(mtk_crtc)) {
+			temporary_cfg = !tetris_dsi_queue_owned(mtk_crtc);
+			ret = tetris_dsi_queue_acquire(mtk_crtc);
+			if (ret) {
+				kfree(cb_data);
+				if (lock)
+					DDP_MUTEX_UNLOCK(&mtk_crtc->lock, __func__, __LINE__);
+				return ret;
+			}
+		}
 		cmdq_handle = sb_cmdq_handle;
 		sb_cmdq_handle = NULL;
 	} else {
@@ -1658,7 +1883,7 @@ int mtk_drm_setbacklight(struct drm_crtc *crtc, unsigned int level,
 		else
 			cmdq_handle =
 				cmdq_pkt_create(
-				mtk_crtc->gce_obj.client[CLIENT_DSI_CFG]);
+				mtk_crtc_tetris_dsi_client(mtk_crtc));
 	}
 
 	if (!cmdq_handle) {
@@ -1739,7 +1964,11 @@ int mtk_drm_setbacklight(struct drm_crtc *crtc, unsigned int level,
 	cb_data->crtc = crtc;
 	cb_data->cmdq_handle = cmdq_handle;
 
+	if (temporary_cfg)
+		tetris_dsi_queue_arm_release(mtk_crtc, cmdq_handle);
 	if (cmdq_pkt_flush_threaded(cmdq_handle, bl_cmdq_cb, cb_data) < 0) {
+		if (temporary_cfg)
+			tetris_dsi_queue_fail(mtk_crtc, -EIO);
 		DDPPR_ERR("failed to flush bl_cmdq_cb\n");
 		ret = -EINVAL;
 	}
@@ -1927,7 +2156,8 @@ int mtk_drm_setbacklight_grp(struct drm_crtc *crtc, unsigned int level,
 	mtk_drm_idlemgr_kick(__func__, crtc, 0);
 
 	is_frame_mode = mtk_crtc_is_frame_trigger_mode(crtc);
-	cmdq_handle = cmdq_pkt_create(mtk_crtc->gce_obj.client[CLIENT_CFG]);
+	cmdq_handle = cmdq_pkt_create(mtk_crtc_is_tetris_vdo_panel(mtk_crtc) ?
+		mtk_crtc_tetris_dsi_client(mtk_crtc) : mtk_crtc->gce_obj.client[CLIENT_CFG]);
 	if (!cmdq_handle) {
 		DDPPR_ERR("%s:%d NULL cmdq handle\n", __func__, __LINE__);
 		DDP_MUTEX_UNLOCK(&mtk_crtc->lock, __func__, __LINE__);
@@ -2047,16 +2277,20 @@ int mtk_drm_aod_setbacklight(struct drm_crtc *crtc, unsigned int level)
 			mtk_dump_analysis(comp);
 	}
 
+	if (mtk_crtc->enabled && mtk_crtc_is_tetris_vdo_panel(mtk_crtc))
+		mtk_drm_idlemgr_kick(__func__, crtc, 0);
+
 	/* send LCM CMD */
 	is_frame_mode = mtk_crtc_is_frame_trigger_mode(&mtk_crtc->base);
 
-	if (is_frame_mode || mtk_crtc->gce_obj.client[CLIENT_DSI_CFG] == NULL)
+	if (is_frame_mode ||
+	    mtk_crtc->gce_obj.client[CLIENT_DSI_CFG] == NULL)
 		cmdq_handle =
 			cmdq_pkt_create(mtk_crtc->gce_obj.client[CLIENT_CFG]);
 	else
 		cmdq_handle =
 			cmdq_pkt_create(
-			mtk_crtc->gce_obj.client[CLIENT_DSI_CFG]);
+			mtk_crtc_tetris_dsi_client(mtk_crtc));
 
 	if (!cmdq_handle) {
 		DDPPR_ERR("%s:%d NULL cmdq handle\n", __func__, __LINE__);
@@ -2256,12 +2490,16 @@ static int mtk_drm_crtc_set_panel_hbm_internal(struct drm_crtc *crtc,
 
 	mtk_drm_idlemgr_kick(__func__, crtc, 0);
 
+	ret = tetris_dsi_queue_acquire(mtk_crtc);
+	if (ret)
+		return ret;
+
 	DDPINFO("%s:set LCM hbm en:%d\n", __func__, en);
 
 	is_frame_mode = mtk_crtc_is_frame_trigger_mode(&mtk_crtc->base);
 
 	/* setHBM would use VM CMD in DSI VDO mode only. */
-	client = (is_frame_mode ||
+	client = (is_frame_mode || mtk_crtc_is_tetris_vdo_panel(mtk_crtc) ||
 		  mtk_crtc->gce_obj.client[CLIENT_DSI_CFG] == NULL) ?
 		mtk_crtc->gce_obj.client[CLIENT_CFG] : mtk_crtc->gce_obj.client[CLIENT_DSI_CFG];
 	cmdq_handle = cmdq_pkt_create(client);
@@ -2335,7 +2573,22 @@ int mtk_drm_crtc_set_panel_hbm(struct drm_crtc *crtc, bool en)
 
 int mtk_drm_crtc_set_panel_hbm_sync(struct drm_crtc *crtc, bool en)
 {
-	return mtk_drm_crtc_set_panel_hbm_internal(crtc, en, true);
+	struct mtk_drm_crtc *mtk_crtc = to_mtk_crtc(crtc);
+	struct mtk_ddp_comp *comp = mtk_ddp_comp_request_output(mtk_crtc);
+	bool was_on = false;
+	int ret;
+
+	if (comp && comp->funcs && comp->funcs->io_cmd)
+		comp->funcs->io_cmd(comp, NULL, DSI_HBM_GET_STATE, &was_on);
+	ret = mtk_drm_crtc_set_panel_hbm_internal(crtc, en, true);
+	if (ret)
+		tetris_dsi_queue_fail(mtk_crtc, ret);
+	else if (!en && was_on)
+		tetris_dsi_queue_sync_off(mtk_crtc);
+	/* Cached-false no-op does not acknowledge a failed/pending OFF packet. */
+	if (!ret && !en && mtk_crtc_is_tetris_vdo_panel(mtk_crtc))
+		mtk_crtc_tetris_dsi_client(mtk_crtc);
+	return ret;
 }
 
 int mtk_drm_crtc_hbm_wait(struct drm_crtc *crtc, bool en)
@@ -8216,6 +8469,7 @@ static void ddp_cmdq_cb(struct cmdq_cb_data data)
 	/* debug log */
 	DDPINFO("%s +\n", __func__);
 
+	tetris_dsi_queue_complete(to_mtk_crtc(crtc), cb_data->cmdq_handle, data.err);
 	mtk_disp_signal_fence_worker_signal(crtc, data);
 	DDPINFO("%s -\n", __func__);
 }
@@ -8262,6 +8516,10 @@ static void ddp_cmdq_cb(struct cmdq_cb_data data)
 			__func__, __LINE__);
 		return;
 	}
+
+#ifndef MTK_DRM_ASYNC_HANDLE
+	tetris_dsi_queue_complete(mtk_crtc, cb_data->cmdq_handle, data.err);
+#endif
 
 	DDPINFO("crtc_state:0x%llx, atomic_state:%lu, crtc:%lu, pf:%u\n",
 		(u64)crtc_state, (unsigned long)atomic_state,
@@ -13162,6 +13420,7 @@ struct cmdq_pkt *mtk_crtc_gce_commit_begin(struct drm_crtc *crtc,
 		mtk_crtc_wait_frame_done(mtk_crtc, cmdq_handle, DDP_FIRST_PATH, 0);
 	}
 
+
 	/* Record Vblank start timestamp */
 	mtk_vblank_config_rec_start(mtk_crtc, cmdq_handle, FRAME_CONFIG);
 
@@ -16397,6 +16656,51 @@ static void sf_cmdq_cb(struct cmdq_cb_data data)
 }
 #endif
 
+/* Queue Tetris panel HBM with the frame which carries HWC's dim layer. */
+static int mtk_crtc_queue_tetris_hbm(struct drm_crtc *crtc,
+				     struct cmdq_pkt *handle, bool en)
+{
+	struct mtk_drm_crtc *mtk_crtc = to_mtk_crtc(crtc);
+	struct mtk_ddp_comp *comp = mtk_ddp_comp_request_output(mtk_crtc);
+	struct mtk_panel_ext *ext;
+	struct mtk_dsi *dsi;
+	bool state = false;
+	int ret;
+
+	if (!handle || !mtk_crtc->enabled ||
+	    !mtk_crtc_is_tetris_vdo_panel(mtk_crtc) || mtk_crtc->hbm_requested ||
+	    mtk_crtc_is_dc_mode(crtc) || mtk_crtc->is_mml || mtk_crtc->is_mml_dl ||
+	    handle->cl != mtk_crtc->gce_obj.client[CLIENT_CFG])
+		return -EOPNOTSUPP;
+
+	dsi = container_of(comp, struct mtk_dsi, ddp_comp);
+	ext = dsi->ext;
+	if (!comp->funcs || !comp->funcs->io_cmd || !ext->funcs ||
+	    !ext->funcs->hbm_get_state || !ext->funcs->hbm_set_pack)
+		return -EINVAL;
+
+	ret = comp->funcs->io_cmd(comp, NULL, DSI_HBM_GET_STATE, &state);
+	if (ret < 0 || state == en)
+		return ret;
+
+	ret = tetris_dsi_queue_acquire(mtk_crtc);
+	if (ret)
+		return ret == -EOPNOTSUPP ? -EIO : ret;
+
+	/* Queue HBM in the same EOF/planes/mutex packet. */
+	mtk_drm_trace_begin("DSI_HBM_FRAME: %d", en);
+	ret = comp->funcs->io_cmd(comp, handle, DSI_HBM_SET, &en);
+	mtk_drm_trace_end("DSI_HBM_FRAME: %d", en);
+	if (ret < 0)
+		return ret;
+
+	/* This checks that the panel driver accepted the queued state. */
+	ret = comp->funcs->io_cmd(comp, NULL, DSI_HBM_GET_STATE, &state);
+	if (ret < 0)
+		return ret;
+	return state == en ? 0 : -EIO;
+}
+
 static void mtk_drm_crtc_atomic_flush(struct drm_crtc *crtc,
 				      struct drm_atomic_state *atomic_state)
 {
@@ -16426,6 +16730,7 @@ static void mtk_drm_crtc_atomic_flush(struct drm_crtc *crtc,
 	unsigned int fps_src = 0;
 	unsigned int fps_dst = 0;
 	bool able_lhbm = true;
+	bool tetris_off_frame = false;
 
 	fps_src = drm_mode_vrefresh(&old_crtc_state->mode);
 	fps_dst = drm_mode_vrefresh(&crtc->state->mode);
@@ -16477,15 +16782,31 @@ static void mtk_drm_crtc_atomic_flush(struct drm_crtc *crtc,
 	if (pending_planes)
 		mtk_crtc->pending_planes = true;
 
-	if (mtk_drm_helper_get_opt(priv->helper_opt, MTK_DRM_OPT_HBM) || mtk_crtc->hbm_requested) {
-		bool hbm_en = false;
+	if (mtk_drm_helper_get_opt(priv->helper_opt, MTK_DRM_OPT_HBM) ||
+	    mtk_crtc->hbm_requested) {
+		bool hbm_en = mtk_crtc_state->prop_val[CRTC_PROP_HBM_ENABLE] ||
+			mtk_crtc->hbm_requested;
+		int hbm_ret;
+		bool was_on = false;
+		struct mtk_ddp_comp *output = mtk_ddp_comp_request_output(mtk_crtc);
 
-		hbm_en = (bool)mtk_crtc_state->prop_val[CRTC_PROP_HBM_ENABLE] || mtk_crtc->hbm_requested;
-		mtk_drm_crtc_set_panel_hbm(crtc, hbm_en);
-		mtk_drm_crtc_hbm_wait(crtc, hbm_en);
+		if (!hbm_en && mtk_crtc_is_tetris_vdo_panel(mtk_crtc) &&
+		    output && output->funcs && output->funcs->io_cmd)
+			output->funcs->io_cmd(output, NULL, DSI_HBM_GET_STATE, &was_on);
 
-			//if (!mtk_crtc_state->prop_val[CRTC_PROP_DOZE_ACTIVE])
-				//mtk_atomic_hbm_bypass_pq(crtc, cmdq_handle, hbm_en);
+		hbm_ret = mtk_crtc_queue_tetris_hbm(crtc, cmdq_handle, hbm_en);
+		if (hbm_ret == -EOPNOTSUPP) {
+			hbm_ret = mtk_drm_crtc_set_panel_hbm(crtc, hbm_en);
+			if (!hbm_ret)
+				hbm_ret = mtk_drm_crtc_hbm_wait(crtc, hbm_en);
+		}
+		if (hbm_ret) {
+			tetris_dsi_queue_fail(mtk_crtc, hbm_ret);
+			DDPPR_ERR("CRTC%u HBM %d failed: %d\n",
+				  index, hbm_en, hbm_ret);
+		} else if (!hbm_en && was_on) {
+			tetris_off_frame = true;
+		}
 	}
 	//printk("fps_dst=%d, fp_status=%lu, doze_active=%llu\n", fps_dst, fp_status, mtk_crtc_state->prop_val[CRTC_PROP_DOZE_ACTIVE]);
 
@@ -16692,9 +17013,13 @@ static void mtk_drm_crtc_atomic_flush(struct drm_crtc *crtc,
 		mtk_vidle_user_power_release_by_gce(DISP_VIDLE_USER_DISP_CMDQ, cmdq_handle);
 
 #ifndef DRM_CMDQ_DISABLE
+	if (tetris_off_frame)
+		tetris_dsi_queue_arm_release(mtk_crtc, cmdq_handle);
 #ifdef MTK_DRM_CMDQ_ASYNC
 	ret = mtk_crtc_gce_flush(crtc, ddp_cmdq_cb, cb_data, cmdq_handle);
 	if (ret) {
+		if (tetris_off_frame)
+			tetris_dsi_queue_fail(mtk_crtc, ret);
 		DDPPR_ERR("mtk_crtc_gce_flush failed!\n");
 		goto end;
 	}
@@ -16704,9 +17029,12 @@ static void mtk_drm_crtc_atomic_flush(struct drm_crtc *crtc,
 #else
 	ret = mtk_crtc_gce_flush(crtc, NULL, NULL, cmdq_handle);
 	if (ret) {
+		if (tetris_off_frame)
+			tetris_dsi_queue_fail(mtk_crtc, ret);
 		DDPPR_ERR("mtk_crtc_gce_flush failed!\n");
 		goto end;
 	}
+	tetris_dsi_queue_complete(mtk_crtc, cmdq_handle, 0);
 	ddp_cmdq_cb_blocking(cb_data);
 #endif
 #endif
