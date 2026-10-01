@@ -2202,6 +2202,7 @@ static void tetris_hbm_frame_arm(struct mtk_drm_crtc *crtc,
 		struct mtk_crtc_state *state, struct mtk_crtc_state *old)
 {
 	struct cmdq_pkt *pkt = state->cmdq_handle;
+	int fps = drm_mode_vrefresh(&state->base.adjusted_mode);
 	struct tetris_hbm_timing_record *rec;
 	unsigned long flags;
 
@@ -2218,8 +2219,8 @@ static void tetris_hbm_frame_arm(struct mtk_drm_crtc *crtc,
 	    !state->base.active || !old->base.active ||
 	    !state->base.enable || !old->base.enable ||
 	    drm_atomic_crtc_needs_modeset(&state->base) ||
-	    drm_mode_vrefresh(&state->base.adjusted_mode) != 120 ||
-	    drm_mode_vrefresh(&old->base.adjusted_mode) != 120 ||
+	    (fps != 120 && fps != 60) ||
+	    drm_mode_vrefresh(&old->base.adjusted_mode) != fps ||
 	    state->prop_val[CRTC_PROP_DISP_MODE_IDX] != old->prop_val[CRTC_PROP_DISP_MODE_IDX] ||
 	    state->prop_val[CRTC_PROP_DOZE_ACTIVE] || old->prop_val[CRTC_PROP_DOZE_ACTIVE] ||
 	    state->doze_changed || state->prop_val[CRTC_PROP_MSYNC2_0_ENABLE] ||
@@ -2227,6 +2228,10 @@ static void tetris_hbm_frame_arm(struct mtk_drm_crtc *crtc,
 	    crtc->cur_usage != DISP_ENABLE || crtc->is_dual_pipe || crtc->sec_on ||
 	    crtc->pending_handle || crtc->skip_frame ||
 	    !crtc->path_data || crtc->path_data->is_discrete_path)
+		goto unlock;
+	/* Keep the new 60 Hz path limited to an interactive scan cycle. */
+	rec->phase = "scan-gate";
+	if (fps == 60 && !tetris_hbm_scan_valid_locked(crtc, &rec->scan))
 		goto unlock;
 	rec->phase = "brightness-gate";
 	if (!tetris_hbm_frame_brightness_locked(crtc, rec))
@@ -3181,7 +3186,9 @@ static bool tetris_hbm_frame_try(struct drm_crtc *crtc, struct mtk_ddp_comp *com
 	if (rec && rec->frame_armed) {
 		rec->frame_armed = false;
 		rec->phase = "brightness-gate";
-		if (tetris_hbm_frame_brightness_locked(mtk_crtc, rec)) {
+		if (rec->fps == 60 && !tetris_hbm_scan_valid_locked(mtk_crtc, &rec->scan)) {
+			rec->phase = "scan-gate";
+		} else if (tetris_hbm_frame_brightness_locked(mtk_crtc, rec)) {
 			low = tetris_hbm_bl_request < 256;
 			result.start_ns = rec->queued_ns;
 			rec->phase = "prewait";
