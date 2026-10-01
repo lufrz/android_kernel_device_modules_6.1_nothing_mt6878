@@ -1829,7 +1829,7 @@ enum tetris_hbm_scan_mode {
 
 struct tetris_hbm_scan_snapshot {
 	u64 token, expires_ns;
-	bool interactive;
+	enum tetris_hbm_scan_mode mode;
 };
 
 struct tetris_hbm_scan_context {
@@ -1974,8 +1974,8 @@ static struct tetris_hbm_scan_snapshot tetris_hbm_scan_claim_locked(
 		return snapshot;
 	snapshot.token = tetris_hbm_scan.token;
 	snapshot.expires_ns = tetris_hbm_scan.expires_ns;
-	snapshot.interactive = tetris_hbm_scan.mode == TETRIS_HBM_SCAN_INTERACTIVE &&
-		(en || tetris_hbm_scan.stock_latched);
+	snapshot.mode = (en || tetris_hbm_scan.stock_latched) ?
+		tetris_hbm_scan.mode : TETRIS_HBM_SCAN_NONE;
 	tetris_hbm_scan.pending = false;
 	tetris_hbm_scan.cycle_open = en;
 	tetris_hbm_scan.stock_latched = false;
@@ -1996,7 +1996,9 @@ static bool tetris_hbm_scan_valid_locked(struct mtk_drm_crtc *crtc,
 		const struct tetris_hbm_scan_snapshot *snapshot)
 {
 	tetris_hbm_scan_expire_locked();
-	return snapshot->interactive && snapshot->token &&
+	return (snapshot->mode == TETRIS_HBM_SCAN_INTERACTIVE ||
+		snapshot->mode == TETRIS_HBM_SCAN_AMBIENT) && snapshot->token &&
+		tetris_hbm_scan.mode == snapshot->mode &&
 		tetris_hbm_scan.crtc == crtc && tetris_hbm_scan.token == snapshot->token &&
 		tetris_hbm_scan.expires_ns == snapshot->expires_ns &&
 		tetris_hbm_scan.expires_ns;
@@ -2229,7 +2231,7 @@ static void tetris_hbm_frame_arm(struct mtk_drm_crtc *crtc,
 	    crtc->pending_handle || crtc->skip_frame ||
 	    !crtc->path_data || crtc->path_data->is_discrete_path)
 		goto unlock;
-	/* Keep the new 60 Hz path limited to an interactive scan cycle. */
+	/* The 60 Hz path requires an explicitly classified scan cycle. */
 	rec->phase = "scan-gate";
 	if (fps == 60 && !tetris_hbm_scan_valid_locked(crtc, &rec->scan))
 		goto unlock;
