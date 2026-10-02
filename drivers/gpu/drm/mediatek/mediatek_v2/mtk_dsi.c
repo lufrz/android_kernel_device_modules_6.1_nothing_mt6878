@@ -6422,12 +6422,10 @@ static void mtk_dsi_cmdq_pack_gce(struct mtk_dsi *dsi, struct cmdq_pkt *handle,
 	} else {
 		cmdq_pkt_clear_event(handle,
 			comp->mtk_crtc->gce_obj.event[EVENT_DSI_CMD_DONE]);
-		mtk_crtc_tetris_hbm_timing_sample(comp->mtk_crtc, handle, TETRIS_HBM_TIMING_MIX);
 		mtk_ddp_write_mask(comp, MIX_MODE, DSI_MODE_CTRL, MIX_MODE,
 				handle);
 		cmdq_pkt_wait_no_clear(handle,
 			comp->mtk_crtc->gce_obj.event[EVENT_DSI_CMD_DONE]);
-		mtk_crtc_tetris_hbm_timing_sample(comp->mtk_crtc, handle, TETRIS_HBM_TIMING_DONE);
 		mtk_ddp_write_mask(comp, 0, DSI_MODE_CTRL, MIX_MODE,
 				handle);
 	}

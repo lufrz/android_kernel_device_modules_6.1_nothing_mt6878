@@ -194,6 +194,7 @@ enum DISP_VBLANK_REC_JOB_TYPE {
 #define DISP_SLOT_VBLANK_REC(n)		\
 	(DISP_SLOT_LAYER_PEAK_RATIO(MAX_FRAME_RATIO_NUMBER * MAX_LAYER_RATIO_NUMBER) + 0x4 + (0x4 * (n)))
 
+/* Keep the reserved layout stable; only the first two words hold completion markers. */
 #define DISP_SLOT_TETRIS_HBM_TIMING_BASE \
 	(DISP_SLOT_VBLANK_REC(MAX_DISP_VBLANK_REC_THREAD * (MAX_DISP_VBLANK_REC_JOB + 2)) + 0x4)
 #define DISP_SLOT_TETRIS_HBM_TIMING(n) \
@@ -1429,14 +1430,6 @@ int mtk_crtc_tetris_hbm_scan_cmd(struct mtk_drm_crtc *crtc, const char *buf, siz
 void mtk_crtc_tetris_hbm_scan_clear(struct mtk_drm_crtc *crtc);
 void mtk_crtc_tetris_hbm_scan_hbm(struct mtk_drm_crtc *crtc, bool en);
 
-enum tetris_hbm_timing_point {
-	TETRIS_HBM_TIMING_EOF, TETRIS_HBM_TIMING_PLANES,
-	TETRIS_HBM_TIMING_MIX, TETRIS_HBM_TIMING_DONE,
-	TETRIS_HBM_TIMING_MUTEX, TETRIS_HBM_TIMING_END,
-	TETRIS_HBM_TIMING_COUNT
-};
-void mtk_crtc_tetris_hbm_timing_sample(struct mtk_drm_crtc *crtc,
-		struct cmdq_pkt *pkt, enum tetris_hbm_timing_point point);
 ssize_t mtk_crtc_tetris_hbm_timing_dump(struct mtk_drm_crtc *crtc, char *buf);
 int mtk_drm_crtc_set_panel_hbm(struct drm_crtc *crtc, bool en);
 int mtk_drm_crtc_set_panel_hbm_sync(struct drm_crtc *crtc, bool en);
