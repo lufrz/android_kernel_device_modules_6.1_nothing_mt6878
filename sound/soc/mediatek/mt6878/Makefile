@@ -39,3 +39,4 @@ snd-soc-mt6878-afe-objs += \
 
 # machine driver
 obj-$(CONFIG_DEVICE_MODULES_SND_SOC_MT6878_MT6369) += mt6878-mt6369.o
+mt6878-mt6369-objs := mt6878-mt6369-card.o tetris-audio-lease.o
