@@ -5412,6 +5412,8 @@ struct mt6369_priv {
 	unsigned int dl_rate[MT6369_AIF_NUM];
 	unsigned int ul_rate[MT6369_AIF_NUM];
 	int ana_gain[AUDIO_ANALOG_VOLUME_TYPE_MAX];
+	/* Owned by the optional media lease, independently of call volume. */
+	bool tetris_media_receiver;
 	unsigned int mux_select[MUX_NUM];
 	int dev_counter[DEVICE_NUM];
 	int hp_gain_ctl;
@@ -5454,6 +5456,9 @@ struct mt6369_priv {
 
 	/* regulator */
 	struct regulator *reg_vant18;
+
+	/* Register encoding used only while tetris_media_receiver is active. */
+	unsigned int tetris_media_receiver_gain;
 };
 
 #define MT_SOC_ENUM_EXT_ID(xname, xenum, xhandler_get, xhandler_put, id) \

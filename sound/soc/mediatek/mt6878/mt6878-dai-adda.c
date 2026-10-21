@@ -10,6 +10,7 @@
 #include <linux/delay.h>
 #include "mt6878-afe-clk.h"
 #include "mt6878-afe-common.h"
+#include "tetris-audio.h"
 #include "mt6878-afe-gpio.h"
 #include "mt6878-interconnection.h"
 
@@ -1645,6 +1646,10 @@ static int mtk_dai_adda_hw_params(struct snd_pcm_substream *substream,
 			       AFE_DL_GAIN1_CTL_PRE_SFT;
 		dl_src_con1 |= MTK_AFE_ADDA_DL_GAIN_NORMAL <<
 			       AFE_DL_GAIN2_CTL_PRE_SFT;
+		if (id == MT6878_DAI_ADDA &&
+		    READ_ONCE(afe_priv->tetris_media_receiver))
+			dl_src_con1 = TETRIS_AUDIO_RECEIVER_GAIN << AFE_DL_GAIN1_CTL_PRE_SFT |
+				TETRIS_AUDIO_RECEIVER_GAIN << AFE_DL_GAIN2_CTL_PRE_SFT;
 
 		/* turn on down-link gain */
 		dl_src_con0 |= (0x01 << AFE_DL_GAIN_ON_CTL_PRE_SFT);
@@ -1994,4 +1999,3 @@ int mt6878_dai_adda_register(struct mtk_base_afe *afe)
 
 	return 0;
 }
-

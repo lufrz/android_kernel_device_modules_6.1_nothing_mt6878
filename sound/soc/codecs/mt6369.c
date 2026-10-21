@@ -1943,6 +1943,8 @@ static int mt_rcv_event(struct snd_soc_dapm_widget *w,
 
 		/* Set HS gain to normal gain step by step */
 		regmap_write(priv->regmap, MT6369_ZCD_CON5,
+			     READ_ONCE(priv->tetris_media_receiver) ?
+			     READ_ONCE(priv->tetris_media_receiver_gain) :
 			     priv->ana_gain[AUDIO_ANALOG_VOLUME_HSOUTL]);
 
 		/* Enable AUD_CLK */

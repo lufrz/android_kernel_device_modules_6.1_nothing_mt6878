@@ -613,6 +613,8 @@ struct mt6878_afe_private {
 	/* speech mixctrl instead property usage */
 	int speech_a2m_msg_id;
 	int speech_md_status;
+	/* Preserve ADDA media gain while the receiver route is active. */
+	bool tetris_media_receiver;
 	int speech_adsp_status;
 	int speech_mic_mute;
 	int speech_dl_mute;
