@@ -398,6 +398,73 @@ int mtk_spk_recv_ipi_buf_from_dsp(int8_t *buffer,
 }
 EXPORT_SYMBOL(mtk_spk_recv_ipi_buf_from_dsp);
 
+static int mtk_spk_ipi_buf_scene(void)
+{
+	int task_scene = -1;
+
+#if IS_ENABLED(CONFIG_SND_SOC_MTK_AUDIO_DSP)
+	task_scene = mtk_get_ipi_buf_scene_adsp();
+#endif
+#if IS_ENABLED(CONFIG_MTK_SCP_AUDIO)
+	if (task_scene == -1)
+		task_scene = mtk_get_ipi_buf_scene_rv();
+#endif
+	return task_scene;
+}
+
+/* Keep the read command and its reply on the same audio task. */
+int mtk_spk_read_ipi_buf_from_dsp(void *command, uint32_t command_size,
+				void *buffer, uint32_t size,
+				uint32_t *actual_size)
+{
+	struct ipi_msg_t ipi_msg;
+	uint32_t received_size = 0;
+	unsigned int spk_type;
+	int task_scene, ret;
+
+	if (!actual_size)
+		return -EINVAL;
+	*actual_size = 0;
+	if (!command || !command_size || !buffer || !size)
+		return -EINVAL;
+
+	task_scene = mtk_spk_ipi_buf_scene();
+	if (task_scene < 0)
+		return -ENODEV;
+	spk_type = mtk_spk_type;
+	memset(&ipi_msg, 0, sizeof(ipi_msg));
+	ret = audio_send_ipi_buf_to_dsp(&ipi_msg, task_scene,
+			AUDIO_DSP_TASK_AURISYS_SET_BUF, spk_type,
+			command, command_size);
+	if (ret)
+		return ret;
+	if (ipi_msg.ack_type != AUDIO_IPI_MSG_ACK_BACK ||
+	    ipi_msg.task_scene != task_scene ||
+	    ipi_msg.msg_id != AUDIO_DSP_TASK_AURISYS_SET_BUF)
+		return -EPROTO;
+	if (mtk_spk_ipi_buf_scene() != task_scene || mtk_spk_type != spk_type)
+		return -EAGAIN;
+
+	memset(&ipi_msg, 0, sizeof(ipi_msg));
+	ret = audio_recv_ipi_buf_from_dsp(&ipi_msg, task_scene,
+			AUDIO_DSP_TASK_AURISYS_GET_BUF, spk_type,
+			buffer, size, &received_size);
+	if (ret)
+		return ret;
+	if (ipi_msg.ack_type != AUDIO_IPI_MSG_ACK_BACK ||
+	    ipi_msg.task_scene != task_scene ||
+	    ipi_msg.msg_id != AUDIO_DSP_TASK_AURISYS_GET_BUF)
+		return -EPROTO;
+	if (mtk_spk_ipi_buf_scene() != task_scene || mtk_spk_type != spk_type)
+		return -EAGAIN;
+	if (received_size > size)
+		return -EMSGSIZE;
+
+	*actual_size = received_size;
+	return 0;
+}
+EXPORT_SYMBOL(mtk_spk_read_ipi_buf_from_dsp);
+
 static const struct i2c_device_id mtk_spk_i2c_id[] = {
 	{ "tfa9874", 0},
 	{ "speaker_amp", 0},

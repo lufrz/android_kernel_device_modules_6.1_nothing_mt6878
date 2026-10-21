@@ -94,5 +94,8 @@ int mtk_spk_send_ipi_buf_to_dsp(void *data_buffer, uint32_t data_size);
 int mtk_spk_recv_ipi_buf_from_dsp(int8_t *buffer,
 				  int16_t size,
 				  uint32_t *buf_len);
+int mtk_spk_read_ipi_buf_from_dsp(void *command, uint32_t command_size,
+				void *buffer, uint32_t size,
+				uint32_t *actual_size);
 #endif
 
