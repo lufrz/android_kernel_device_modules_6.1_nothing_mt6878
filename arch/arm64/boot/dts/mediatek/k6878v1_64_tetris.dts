@@ -67,6 +67,9 @@
 		//reset-gpio = <&pio 151 0>; /*aw88230,aw88257,aw88261,aw88265 不能配置*/
 		irq-gpio = <&pio 41 0x0>;
 		sync-load = <1>;
+		/* Expose channel selection while preserving the stock left-channel default. */
+		spin-mode = "reg_spin";
+		spin-data = "l r l r";
 		aw-re-min = <5000>;
 		aw-re-max = <7000>;
 		/*aw-cali-mode = "none";*/
@@ -75,6 +78,7 @@
 };
 
 &sound {
+	nothing,tetris-audio-lease;
 	mediatek,speaker-codec {
 		sound-dai = <&aw882xx_smartpa_0>;
 	};
