@@ -1890,6 +1890,19 @@ static int mtk_upm6720_is_chg_enabled(struct charger_device *chg_dev, bool *en)
     return ret;
 }
 
+/* Read the enable latch even when the converter is not switching. */
+static int mtk_upm6720_is_charge_enabled(struct charger_device *chg_dev, bool *en)
+{
+    struct upm6720 *upm = charger_get_data(chg_dev);
+    u8 val;
+    int ret;
+
+    ret = upm6720_read_byte(upm, UPM6720_REG_0F, &val);
+    if (!ret)
+        *en = !!(val & UPM6720_CHG_EN_MASK);
+    return ret;
+}
+
 static int mtk_upm6720_enable_chg(struct charger_device *chg_dev, bool en)
 {
     struct upm6720 *upm = charger_get_data(chg_dev);
@@ -2173,6 +2186,7 @@ static int mtk_upm6720_enable_vac_otgovp(struct charger_device *chg_dev, bool en
 static const struct charger_ops upm_chg_ops = {
 	 .enable = mtk_upm6720_enable_chg,
 	 .is_enabled = mtk_upm6720_is_chg_enabled,
+    .is_charge_enabled = mtk_upm6720_is_charge_enabled,
 	 .get_adc = mtk_upm6720_get_adc,
      .get_adc_accuracy = mtk_upm6720_get_adc_accuracy,
 	 .set_vbusovp = mtk_upm6720_set_vbusovp,
