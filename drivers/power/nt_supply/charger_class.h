@@ -67,6 +67,9 @@ struct charger_device {
 	struct srcu_notifier_head evt_nh;
 	void	*driver_data;
 	bool is_polling_mode;
+	/* Independent charge inhibition; never controls the input power path. */
+	struct mutex enable_lock;
+	bool charge_inhibited;
 };
 
 enum charger_property {
@@ -226,6 +229,10 @@ struct charger_ops {
 	int (*enable_ship_mode)(struct charger_device *dev, bool en);
 	int (*get_cp_status)(struct charger_device *dev, u32 evt);
 	int (*get_hvchg_detect_status)(struct charger_device *dev, bool *en);
+	/* Observed buck enabled with input high impedance disabled. */
+	int (*is_powerpath_active)(struct charger_device *dev, bool *active);
+	/* Charge-enable latch, independent of whether conversion is running. */
+	int (*is_charge_enabled)(struct charger_device *dev, bool *enabled);
 };
 
 static inline void *charger_dev_get_drvdata(
@@ -258,6 +265,13 @@ static inline void *charger_get_data(
 }
 
 extern int charger_dev_enable(struct charger_device *charger_dev, bool en);
+extern int charger_dev_set_charge_inhibited(struct charger_device *charger_dev,
+	bool inhibit);
+extern bool charger_dev_is_charge_inhibited(struct charger_device *charger_dev);
+extern int charger_dev_is_powerpath_active(struct charger_device *charger_dev,
+	bool *active);
+extern int charger_dev_is_charge_enabled(struct charger_device *charger_dev,
+	bool *enabled);
 extern int charger_dev_is_enabled(struct charger_device *charger_dev, bool *en);
 extern int charger_dev_plug_in(struct charger_device *charger_dev);
 extern int charger_dev_plug_out(struct charger_device *charger_dev);

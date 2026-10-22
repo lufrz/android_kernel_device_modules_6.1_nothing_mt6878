@@ -34,12 +34,62 @@ static void charger_device_release(struct device *dev)
 
 int charger_dev_enable(struct charger_device *chg_dev, bool en)
 {
-	if (chg_dev != NULL && chg_dev->ops != NULL && chg_dev->ops->enable)
-		return chg_dev->ops->enable(chg_dev, en);
+	int ret = -EOPNOTSUPP;
 
-	return -EOPNOTSUPP;
+	if (!chg_dev)
+		return ret;
+	mutex_lock(&chg_dev->enable_lock);
+	if (en && chg_dev->charge_inhibited)
+		ret = -EBUSY;
+	else if (chg_dev->ops && chg_dev->ops->enable)
+		ret = chg_dev->ops->enable(chg_dev, en);
+	mutex_unlock(&chg_dev->enable_lock);
+	return ret;
 }
 EXPORT_SYMBOL(charger_dev_enable);
+
+/* The manager owns this vote. Releasing it does not enable the hardware. */
+int charger_dev_set_charge_inhibited(struct charger_device *chg_dev, bool inhibit)
+{
+	int ret = 0;
+
+	if (!chg_dev)
+		return -ENODEV;
+	mutex_lock(&chg_dev->enable_lock);
+	WRITE_ONCE(chg_dev->charge_inhibited, inhibit);
+	if (inhibit) {
+		if (chg_dev->ops && chg_dev->ops->enable)
+			ret = chg_dev->ops->enable(chg_dev, false);
+		else
+			ret = -EOPNOTSUPP;
+	}
+	mutex_unlock(&chg_dev->enable_lock);
+	return ret;
+}
+EXPORT_SYMBOL(charger_dev_set_charge_inhibited);
+
+/* Drivers with internal enable sequences check this under their hardware lock. */
+bool charger_dev_is_charge_inhibited(struct charger_device *chg_dev)
+{
+	return chg_dev && READ_ONCE(chg_dev->charge_inhibited);
+}
+EXPORT_SYMBOL(charger_dev_is_charge_inhibited);
+
+int charger_dev_is_powerpath_active(struct charger_device *chg_dev, bool *active)
+{
+	if (chg_dev && chg_dev->ops && chg_dev->ops->is_powerpath_active)
+		return chg_dev->ops->is_powerpath_active(chg_dev, active);
+	return -EOPNOTSUPP;
+}
+EXPORT_SYMBOL(charger_dev_is_powerpath_active);
+
+int charger_dev_is_charge_enabled(struct charger_device *chg_dev, bool *enabled)
+{
+	if (chg_dev && chg_dev->ops && chg_dev->ops->is_charge_enabled)
+		return chg_dev->ops->is_charge_enabled(chg_dev, enabled);
+	return -EOPNOTSUPP;
+}
+EXPORT_SYMBOL(charger_dev_is_charge_enabled);
 
 int charger_dev_is_enabled(struct charger_device *chg_dev, bool *en)
 {
@@ -971,6 +1021,7 @@ struct charger_device *charger_device_register(const char *name,
 	/* Rename srcu's lock to avoid LockProve warning */
 	lockdep_init_map(&(&head->srcu)->dep_map, name, &key, 0);
 	mutex_init(&chg_dev->ops_lock);
+	mutex_init(&chg_dev->enable_lock);
 	chg_dev->dev.class = charger_class;
 	chg_dev->dev.parent = parent;
 	chg_dev->dev.release = charger_device_release;
