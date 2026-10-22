@@ -1,0 +1,42 @@
+What:           /proc/gpufreqv2/limit_table (boost command)
+Date:           October 2026
+Contact:        Tetris device maintainers
+Description:
+                On single-domain GPUFREQ v2 devices, writing "boost <kHz>"
+                requests a UI frequency floor through the existing APIBOOST
+                limiter. The lowest frequency at least as high as the request
+                is selected from the live GPU working OPP table. The command
+                never creates an OPP or changes voltage, limiter priorities,
+                enable switches, ceilings, or fixed-frequency controls.
+
+                The number is unsigned decimal. Invalid, unordered, empty or
+                oversized tables, a request above the highest supported OPP,
+                malformed commands, embedded NULs and writes of 64 bytes or
+                more are rejected. Dual-domain devices reject the command.
+                "boost 0" releases the UI request without requiring a valid
+                working table. Existing set/switch commands remain available.
+
+                UI and legacy GED APIBOOST requests are combined, retaining
+                the stronger floor. Releasing UI restores the latest legacy
+                request, including changes made while UI was active. The
+                APIBOOST ceiling is preserved. A configured DEBUG minimum or
+                maximum suspends UI, even when DEBUG switches are disabled.
+                UI is removed before a DEBUG write and restored after the
+                manual range is cleared. This avoids adding a stronger floor
+                under DEBUG's higher priority. Other limiter arbitration and
+                the driver's DVFS state handling remain in effect.
+
+                The command has no kernel timeout. PowerHAL must release it
+                when the last participating hint ends and reset it on service
+                initialization. Requested state is retained if a transport or
+                commit fails, so a retry or later limiter request can reconcile
+                it. If restoring the legacy floor fails, a DEBUG write is not
+                attempted. A failed DEBUG write leaves UI suspended until a
+                later successful request. If UI reapplication fails after a
+                successful DEBUG clear, the command returns the failure even
+                though the DEBUG change has already taken effect.
+
+                gpufreq_status and the existing limiter table report effective
+                driver state; a requested floor does not promise a clock while
+                the GPU is idle, fixed by another control, or capped by another
+                limiter. GPUEB firmware handling requires device validation.

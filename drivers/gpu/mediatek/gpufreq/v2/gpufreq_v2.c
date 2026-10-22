@@ -91,6 +91,12 @@ static unsigned long g_ipi_irq_flags;
 static unsigned long g_pwr_irq_flags;
 static raw_spinlock_t gpufreq_ipi_lock;
 static raw_spinlock_t gpufreq_power_lock;
+/* APIBOOST has two AP clients, but remains one limiter in the firmware ABI. */
+static DEFINE_MUTEX(gpufreq_ui_boost_lock);
+static bool g_ui_boost_initialized;
+static bool g_ui_boost_suspended;
+static unsigned int g_ui_boost_freq;
+static int g_api_boost_floor = GPUPPM_DEFAULT_IDX;
 
 /**
  * ===============================================
@@ -958,7 +964,7 @@ EXPORT_SYMBOL(gpufreq_dual_commit);
  * Description        : Set ceiling and floor limit to GPU DVFS by specified limiter
  *                      It will immediately trigger DVFS if current OPP violates limit
  ***********************************************************************************/
-int gpufreq_set_limit(enum gpufreq_target target,
+static int gpufreq_set_limit_raw(enum gpufreq_target target,
 	enum gpuppm_limiter limiter, int ceiling_info, int floor_info)
 {
 	struct gpufreq_ipi_data send_msg = {};
@@ -1006,7 +1012,146 @@ done:
 
 	return ret;
 }
+
+/* The working table, not a signed/bin-specific table, defines firmware indexes. */
+static int gpufreq_ui_boost_oppidx(unsigned int freq)
+{
+	unsigned int opp_freq, previous = 0;
+	int count, i, index = GPUFREQ_EINVAL;
+
+	if (!g_shared_status)
+		return GPUFREQ_ENOENT;
+	count = READ_ONCE(g_shared_status->opp_num_gpu);
+	if (count <= 0 || count > GPUFREQ_MAX_OPP_NUM)
+		return GPUFREQ_EINVAL;
+	for (i = 0; i < count; i++) {
+		opp_freq = READ_ONCE(g_shared_status->working_table_gpu[i].freq);
+		if (!opp_freq || (i && opp_freq >= previous))
+			return GPUFREQ_EINVAL;
+		if (opp_freq >= freq)
+			index = i;
+		previous = opp_freq;
+	}
+	if (count != READ_ONCE(g_shared_status->opp_num_gpu))
+		return GPUFREQ_EINVAL;
+	return index;
+}
+
+static bool gpufreq_ui_boost_debug_active(void)
+{
+	return READ_ONCE(g_shared_status->limit_table[LIMIT_DEBUG].ceiling) >= 0 ||
+		READ_ONCE(g_shared_status->limit_table[LIMIT_DEBUG].floor) >= 0;
+}
+
+static int gpufreq_ui_boost_init_locked(void)
+{
+	if (!g_shared_status)
+		return GPUFREQ_ENOENT;
+	if (!g_ui_boost_initialized) {
+		g_api_boost_floor = READ_ONCE(g_shared_status->limit_table[LIMIT_APIBOOST].floor);
+		g_ui_boost_suspended = gpufreq_ui_boost_debug_active();
+		g_ui_boost_initialized = true;
+	}
+	return GPUFREQ_SUCCESS;
+}
+
+/* Match the existing set-limit handling of reset, keep and invalid indexes. */
+static int gpufreq_ui_boost_limit_idx(int previous, int requested)
+{
+	if (requested == GPUPPM_DEFAULT_IDX || requested == GPUPPM_RESET_IDX)
+		return GPUPPM_DEFAULT_IDX;
+	if (requested >= 0 && requested < READ_ONCE(g_shared_status->opp_num_gpu))
+		return requested;
+	return previous;
+}
+
+static int gpufreq_ui_boost_floor(int legacy_floor)
+{
+	int ui_floor;
+
+	if (!g_ui_boost_freq || g_ui_boost_suspended || gpufreq_ui_boost_debug_active())
+		return legacy_floor;
+	/* Remap each request if the firmware working table has changed. */
+	ui_floor = gpufreq_ui_boost_oppidx(g_ui_boost_freq);
+	if (ui_floor < 0)
+		return legacy_floor;
+	return legacy_floor < 0 ? ui_floor : min(legacy_floor, ui_floor);
+}
+
+int gpufreq_set_limit(enum gpufreq_target target,
+	enum gpuppm_limiter limiter, int ceiling_info, int floor_info)
+{
+	int ret, ceiling, floor;
+
+	/* Only GED's mutex/proc callers need serialization; leave other paths alone. */
+	if (g_dual_buck || (target != TARGET_DEFAULT && target != TARGET_GPU) ||
+		(limiter != LIMIT_APIBOOST && limiter != LIMIT_DEBUG))
+		return gpufreq_set_limit_raw(target, limiter, ceiling_info, floor_info);
+
+	mutex_lock(&gpufreq_ui_boost_lock);
+	/* Existing configurations that never use boost retain the original writes. */
+	if (!g_ui_boost_initialized) {
+		ret = gpufreq_set_limit_raw(target, limiter, ceiling_info, floor_info);
+		goto done;
+	}
+	ret = gpufreq_ui_boost_init_locked();
+	if (ret)
+		goto done;
+	if (limiter == LIMIT_APIBOOST) {
+		/* Keep the latest legacy intent even if the transport needs a retry. */
+		g_api_boost_floor = gpufreq_ui_boost_limit_idx(g_api_boost_floor, floor_info);
+		ret = gpufreq_set_limit_raw(target, limiter, ceiling_info,
+			gpufreq_ui_boost_floor(g_api_boost_floor));
+		goto done;
+	}
+
+	/* DEBUG's priority can otherwise be inherited by a lower-priority UI floor. */
+	ceiling = gpufreq_ui_boost_limit_idx(
+		READ_ONCE(g_shared_status->limit_table[LIMIT_DEBUG].ceiling), ceiling_info);
+	floor = gpufreq_ui_boost_limit_idx(
+		READ_ONCE(g_shared_status->limit_table[LIMIT_DEBUG].floor), floor_info);
+	g_ui_boost_suspended = true;
+	ret = gpufreq_set_limit_raw(target, LIMIT_APIBOOST, GPUPPM_KEEP_IDX, g_api_boost_floor);
+	if (ret)
+		goto done;
+	ret = gpufreq_set_limit_raw(target, limiter, ceiling_info, floor_info);
+	if (ret)
+		goto done;
+	g_ui_boost_suspended = ceiling >= 0 || floor >= 0;
+	if (g_ui_boost_freq && !g_ui_boost_suspended)
+		ret = gpufreq_set_limit_raw(target, LIMIT_APIBOOST, GPUPPM_KEEP_IDX,
+			gpufreq_ui_boost_floor(g_api_boost_floor));
+done:
+	mutex_unlock(&gpufreq_ui_boost_lock);
+	return ret;
+}
 EXPORT_SYMBOL(gpufreq_set_limit);
+
+/* Internal to mtk_gpufreq_wrapper; the proc command is the userspace interface. */
+int gpufreq_set_ui_boost_khz(unsigned int freq)
+{
+	int ret;
+
+	if (g_dual_buck)
+		return GPUFREQ_EINVAL;
+	mutex_lock(&gpufreq_ui_boost_lock);
+	ret = gpufreq_ui_boost_init_locked();
+	if (ret)
+		goto done;
+	/* Releasing a request must still work when the table is unavailable. */
+	if (freq) {
+		ret = gpufreq_ui_boost_oppidx(freq);
+		if (ret < 0)
+			goto done;
+	}
+	g_ui_boost_freq = freq;
+	g_ui_boost_suspended = gpufreq_ui_boost_debug_active();
+	ret = gpufreq_set_limit_raw(TARGET_GPU, LIMIT_APIBOOST, GPUPPM_KEEP_IDX,
+		gpufreq_ui_boost_floor(g_api_boost_floor));
+done:
+	mutex_unlock(&gpufreq_ui_boost_lock);
+	return ret;
+}
 
 /***********************************************************************************
  * Function Name      : gpufreq_get_cur_limit_idx

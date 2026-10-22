@@ -20,6 +20,7 @@
 #include <linux/mutex.h>
 #include <linux/kernel.h>
 #include <linux/uaccess.h>
+#include <linux/ctype.h>
 
 #include <gpufreq_v2.h>
 #include <gpufreq_mssv.h>
@@ -402,24 +403,53 @@ done:
 	return ret;
 }
 
+/* Return one for the new command, zero for the existing set/switch grammar. */
+static int gpufreq_parse_ui_boost(char *buf, unsigned int *freq)
+{
+	char *value, *p;
+	int ret;
+
+	buf = skip_spaces(buf);
+	if (strncmp(buf, "boost", 5))
+		return 0;
+	if (!isspace(buf[5]))
+		return GPUFREQ_EINVAL;
+	value = strim(buf + 5);
+	if (!*value)
+		return GPUFREQ_EINVAL;
+	for (p = value; *p; p++) {
+		if (!isdigit(*p))
+			return GPUFREQ_EINVAL;
+	}
+	ret = kstrtouint(value, 10, freq);
+	return ret ? ret : 1;
+}
+
 static ssize_t limit_table_proc_write(struct file *file,
 		const char __user *buffer, size_t count, loff_t *data)
 {
 	int ret = GPUFREQ_SUCCESS;
 	char buf[64], cmd[64];
-	unsigned int len = 0;
+	unsigned int freq;
 	int limiter = 0, ceiling = 0, floor = 0;
 
-	len = (count < (sizeof(buf) - 1)) ? count : (sizeof(buf) - 1);
-	if (copy_from_user(buf, buffer, len)) {
+	if (!count || count >= sizeof(buf))
+		return GPUFREQ_EINVAL;
+	if (copy_from_user(buf, buffer, count)) {
 		ret = GPUFREQ_EINVAL;
 		goto done;
 	}
-	buf[len] = '\0';
+	if (memchr(buf, '\0', count))
+		return GPUFREQ_EINVAL;
+	buf[count] = '\0';
 
 	mutex_lock(&gpufreq_debug_lock);
 
-	if (sscanf(buf, "%6s %2d %2d %2d", cmd, &limiter, &ceiling, &floor) == 4) {
+	ret = gpufreq_parse_ui_boost(buf, &freq);
+	if (ret > 0) {
+		ret = gpufreq_set_ui_boost_khz(freq);
+	} else if (!ret &&
+		sscanf(buf, "%6s %2d %2d %2d", cmd, &limiter, &ceiling, &floor) == 4) {
 		if (sysfs_streq(cmd, "set")) {
 			ret = gpufreq_set_limit(TARGET_DEFAULT, limiter, ceiling, floor);
 			if (ret)
