@@ -802,6 +802,10 @@ static int mt6375_chg_enable_charging(struct mt6375_chg_data *ddata, bool en)
 	int ret;
 
 	mutex_lock(&ddata->cv_lock);
+	if (en && charger_dev_is_charge_inhibited(ddata->chgdev)) {
+		mutex_unlock(&ddata->cv_lock);
+		return -EBUSY;
+	}
 	ret = mt6375_chg_field_set(ddata, F_CHG_EN, en);
 	mutex_unlock(&ddata->cv_lock);
 	if (g_chg_flg != en) {
@@ -861,7 +865,8 @@ out_cv:
 	ret = mt6375_chg_field_set(ddata, F_CV, mV);
 	if (!ret)
 		ddata->cv = mV;
-	if (done && enabled)
+	if (done && enabled &&
+	    !charger_dev_is_charge_inhibited(ddata->chgdev))
 		mt6375_chg_field_set(ddata, F_CHG_EN, true);
 out:
 	mutex_unlock(&ddata->cv_lock);
@@ -2085,6 +2090,20 @@ static int mt6375_is_buck_enabled(struct charger_device *chgdev, bool *en)
 	return 0;
 }
 
+static int mt6375_is_powerpath_active(struct charger_device *chgdev, bool *active)
+{
+	struct mt6375_chg_data *ddata = charger_get_data(chgdev);
+	unsigned int val;
+	int ret;
+
+	/* Read both bits together: BUCK_EN alone does not exclude HZ mode. */
+	ret = regmap_read(ddata->rmap, MT6375_REG_CHG_TOP1, &val);
+	if (ret < 0)
+		return ret;
+	*active = !!(val & BIT(1)) && !(val & BIT(3));
+	return 0;
+}
+
 static int mt6375_enable_chg_timer(struct charger_device *chgdev, bool en)
 {
 	struct mt6375_chg_data *ddata = charger_get_data(chgdev);
@@ -2191,7 +2210,7 @@ static int mt6375_run_pe(struct mt6375_chg_data *ddata, bool pe20)
 	ret = mt6375_chg_field_set(ddata, F_CC, 2000);
 	if (ret < 0)
 		return ret;
-	ret = mt6375_chg_field_set(ddata, F_CHG_EN, 1);
+	ret = mt6375_chg_enable_charging(ddata, true);
 	if (ret < 0)
 		return ret;
 	ret = mt6375_chg_field_set(ddata, F_PE_SEL, pe20);
@@ -2805,6 +2824,7 @@ static const struct charger_ops mt6375_chg_ops = {
 	/* enable */
 	.enable = mt6375_enable_charging,
 	.is_enabled = mt6375_is_enabled,
+	.is_charge_enabled = mt6375_is_enabled,
 	/* charging current */
 	.set_charging_current = mt6375_set_ichg,
 	.get_charging_current = mt6375_get_ichg,
@@ -2839,6 +2859,7 @@ static const struct charger_ops mt6375_chg_ops = {
 	/* power path */
 	.enable_powerpath = mt6375_enable_buck,
 	.is_powerpath_enabled = mt6375_is_buck_enabled,
+	.is_powerpath_active = mt6375_is_powerpath_active,
 	/* timer */
 	.enable_safety_timer = mt6375_enable_chg_timer,
 	.is_safety_timer_enabled = mt6375_is_chg_timer_enabled,
