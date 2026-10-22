@@ -886,6 +886,17 @@ static int mtk_sc8541_is_chg_enabled(struct charger_device *chg_dev, bool *en)
     return ret;
 }
 
+static int mtk_sc8541_is_charge_enabled(struct charger_device *chg_dev, bool *en)
+{
+    struct sc8541_chip *sc = charger_get_data(chg_dev);
+    int ret, val;
+
+    ret = sc8541_field_read(sc, CHG_EN, &val);
+    if (!ret)
+        *en = !!val;
+    return ret;
+}
+
 
 static int mtk_sc8541_enable_chg(struct charger_device *chg_dev, bool en)
 {
@@ -1100,6 +1111,7 @@ static int mtk_sc8541_dump_registers(struct charger_device *chg_dev)
 static const struct charger_ops sc8541_chg_ops = {
 	 .enable = mtk_sc8541_enable_chg,
 	 .is_enabled = mtk_sc8541_is_chg_enabled,
+    .is_charge_enabled = mtk_sc8541_is_charge_enabled,
 	 .get_adc = mtk_sc8541_get_adc,
      .get_adc_accuracy = mtk_sc8541_get_adc_accuracy,
 	 .set_vbusovp = mtk_sc8541_set_vbusovp,
@@ -1144,7 +1156,7 @@ static int sc_sc8541_set_enable(struct dvchg_dev *charger_pump, bool enable)
     struct sc8541_chip *sc = dvchg_get_private(charger_pump);
     int ret;
 
-    ret = sc8541_enable_charge(sc,enable);
+    ret = charger_dev_enable(sc->chg_dev, enable);
 
     return ret;
 }
@@ -1421,10 +1433,7 @@ static int sc8541_charger_set_property(struct power_supply *psy,
 
     switch (prop) {
     case POWER_SUPPLY_PROP_ONLINE:
-        sc8541_enable_charge(sc, val->intval);
-        dev_info(sc->dev, "POWER_SUPPLY_PROP_ONLINE: %s\n",
-                val->intval ? "enable" : "disable");
-        break;
+        return charger_dev_enable(sc->chg_dev, val->intval);
     default:
         return -EINVAL;
     }
