@@ -1790,6 +1790,20 @@ static void check_battery_psy_change_status(struct nt_chg_info *nci, bool need_u
 	}
 }
 
+static void nt_set_camera_input_current(struct mtk_charger *info, u32 input_limit)
+{
+	bool managed;
+
+	/* Keep camera restores from replacing the bypass source/thermal budget. */
+	mutex_lock(&info->charger_lock);
+	managed = info->charge_bypass_requested;
+	if (!managed)
+		charger_dev_set_input_current(info->chg1_dev, input_limit);
+	mutex_unlock(&info->charger_lock);
+	if (managed)
+		_wake_up_charger(info);
+}
+
 static int nt_ctrl_charge(struct nt_chg_info *nci)
 {
 	struct mtk_charger *info;
@@ -1865,7 +1879,7 @@ static int nt_ctrl_charge(struct nt_chg_info *nci)
 			pr_info("%s: Stop hv charging. en_hv:%d alg:%s alg_vbus:%d\n",
 				__func__, info->enable_hv_charging,	dev_name(&alg->dev), val);
 		}
-		charger_dev_set_input_current(info->chg1_dev, NT_CAM_LMT_IBUS);
+		nt_set_camera_input_current(info, NT_CAM_LMT_IBUS);
 		charger_dev_enable(info->chg1_dev, true);
 		info->enable_hv_charging = false;
 		nci->cam_lmt = NT_CAM_LMT_IBUS;
@@ -1875,7 +1889,7 @@ static int nt_ctrl_charge(struct nt_chg_info *nci)
 		info->enable_hv_charging = true;
 		nci->cam_lmt = -1;
 		pdata->thermal_input_current_limit = -1;
-		charger_dev_set_input_current(info->chg1_dev, NT_CAM_RESTORE_IBUS);
+		nt_set_camera_input_current(info, NT_CAM_RESTORE_IBUS);
 		nt_ctrl_count = 0;
 		return EXIT_WQ;
 	}

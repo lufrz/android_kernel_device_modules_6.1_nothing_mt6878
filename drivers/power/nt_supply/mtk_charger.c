@@ -130,12 +130,17 @@ static int mtk_charger_enable_power_path_cust(struct mtk_charger *info,
 		info->usb_disable_pp = !en;
 	if (info->usb_psy == psy)
 		info->pd_disable_pp = !en;
-	if (area_id != 3) {
+	if (area_id != 3 && !READ_ONCE(info->charge_bypass_requested)) {
 		info->usb_disable_pp = false;
 		info->pd_disable_pp = false;
 	}
 
-	if ((info->aging_mode == true && info->cmd_discharging == false)
+	if (READ_ONCE(info->charge_bypass_input_blocked) ||
+	    (READ_ONCE(info->charge_bypass_requested) &&
+	     (!info->cmd_en_pp || info->usb_disable_pp || info->pd_disable_pp ||
+	      info->force_disable_pp[CHG1_SETTING])))
+		setting = false;
+	else if ((info->aging_mode == true && info->cmd_discharging == false)
 			|| (info->safety_timeout == true)) {
 		setting = true;
 	} else if (info->usb_disable_pp || info->pd_disable_pp)
@@ -161,6 +166,26 @@ static int mtk_charger_enable_power_path_cust(struct mtk_charger *info,
 	ret = charger_dev_enable_powerpath(chg_dev, setting);
 out:
 	mutex_unlock(&info->pp_lock[CHG1_SETTING]);
+	return ret;
+}
+
+int mtk_charger_refresh_power_path(struct mtk_charger *info)
+{
+	lockdep_assert_held(&info->charger_lock);
+	return mtk_charger_enable_power_path_cust(info, NULL, info->cmd_en_pp);
+}
+
+/* Serialize legacy manual writes with the bypass input restriction. */
+static int mtk_charger_set_manual_power_path(struct mtk_charger *info, bool enable)
+{
+	int ret;
+
+	mutex_lock(&info->charger_lock);
+	if (info->charge_bypass_requested && enable)
+		ret = mtk_charger_enable_power_path_cust(info, NULL, enable);
+	else
+		ret = charger_dev_enable_powerpath(info->chg1_dev, enable);
+	mutex_unlock(&info->charger_lock);
 	return ret;
 }
 
@@ -202,6 +227,7 @@ void _wake_up_charger(struct mtk_charger *info)
 	info->charger_thread_timeout = true;
 	wake_up_interruptible(&info->wait_que);
 }
+EXPORT_SYMBOL_GPL(_wake_up_charger);
 
 bool is_disable_charger(struct mtk_charger *info)
 {
@@ -1898,7 +1924,7 @@ static ssize_t mtk_chg_en_power_path_write(struct file *file,
 
 	ret = kstrtou32(desc, 10, &enable);
 	if (ret == 0) {
-		charger_dev_enable_powerpath(info->chg1_dev, enable);
+		mtk_charger_set_manual_power_path(info, enable);
 		chr_info("%s: enable power path = %d\n", __func__, enable);
 		return count;
 	}
@@ -2527,7 +2553,7 @@ static ssize_t enable_power_path_store(
 		else
 			enable = true;
 
-		charger_dev_enable_powerpath(info->chg1_dev, enable);
+		mtk_charger_set_manual_power_path(info, enable);
 		info->cmd_pp = enable;
 		chr_err("%s: enable power path = %d\n", __func__, enable);
 	}
@@ -3010,6 +3036,8 @@ static void charger_check_status(struct mtk_charger *info)
 			info->charging_by_uisoc = false;
 	}
 stop_charging:
+	if (info->charge_bypass_requested)
+		charging = false;
 	mtk_battery_notify_check(info);
 
 	if (charging && uisoc < 80 && info->batpro_done == true) {
@@ -3290,6 +3318,7 @@ static int mtk_charger_plug_out(struct mtk_charger *info)
 	int i;
 
 	chr_err("%s\n", __func__);
+	mtk_charge_bypass_reset_locked(info);
 	info->chr_type = POWER_SUPPLY_TYPE_UNKNOWN;
 	info->charger_thread_polling = false;
 	info->pd_reset = false;
@@ -3372,6 +3401,7 @@ static bool mtk_is_charger_on(struct mtk_charger *info)
 
 	chr_type = get_charger_type(info);
 	if (chr_type == POWER_SUPPLY_TYPE_UNKNOWN) {
+		mtk_charge_bypass_reset_locked(info);
 		if (info->chr_type != POWER_SUPPLY_TYPE_UNKNOWN) {
 			mtk_charger_plug_out(info);
 			mutex_lock(&info->cable_out_lock);
@@ -3523,6 +3553,9 @@ static int charger_routine_thread(void *arg)
 		while (is_module_init_done == false) {
 			if (charger_init_algo(info) == true) {
 				is_module_init_done = true;
+				mutex_lock(&info->charger_lock);
+				info->charge_bypass_ready = true;
+				mutex_unlock(&info->charger_lock);
 				if (info->charger_unlimited) {
 					info->enable_sw_safety_timer = false;
 					charger_dev_enable_safety_timer(info->chg1_dev, false);
@@ -3579,6 +3612,9 @@ static int charger_routine_thread(void *arg)
 		charger_check_status(info);
 		kpoc_power_off_check(info);
 
+		if (info->charge_bypass_requested && is_charger_on)
+			mtk_charge_bypass_update_input_locked(info);
+
 		if (is_disable_charger(info) == false &&
 			is_charger_on == true &&
 			info->can_charging == true) {
@@ -3588,7 +3624,8 @@ static int charger_routine_thread(void *arg)
 		} else {
 			chr_debug("disable charging %d %d %d\n",
 			    is_disable_charger(info), is_charger_on, info->can_charging);
-			if (is_charger_on == true && info->cmd_discharging) {
+			if (!info->charge_bypass_requested &&
+			    is_charger_on == true && info->cmd_discharging) {
 				if (!info->usb_disable_pp && !info->pd_disable_pp && info->cmd_en_pp) {
 					charger_dev_get_input_current(info->chg1_dev, &aicl);
 					if (info->usb_type == POWER_SUPPLY_USB_TYPE_DCP && aicl != 2000000)
@@ -4102,8 +4139,13 @@ static int mtk_charger_force_disable_power_path(struct mtk_charger *info,
 		goto out;
 
 	info->force_disable_pp[idx] = disable;
-	ret = charger_dev_enable_powerpath(chg_dev,
-		info->force_disable_pp[idx] ? false : info->enable_pp[idx]);
+	if (idx == CHG1_SETTING && READ_ONCE(info->charge_bypass_requested) &&
+	    (READ_ONCE(info->charge_bypass_input_blocked) || !info->cmd_en_pp ||
+	     info->usb_disable_pp || info->pd_disable_pp))
+		ret = charger_dev_enable_powerpath(chg_dev, false);
+	else
+		ret = charger_dev_enable_powerpath(chg_dev,
+			info->force_disable_pp[idx] ? false : info->enable_pp[idx]);
 out:
 	mutex_unlock(&info->pp_lock[idx]);
 	return ret;
@@ -4373,7 +4415,7 @@ static char *mtk_charger_supplied_to[] = {
 static int mtk_charger_probe(struct platform_device *pdev)
 {
 	struct mtk_charger *info = NULL;
-	int i;
+	int i, ret;
 	char *name = NULL;
 
 	chr_err("%s: starts\n", __func__);
@@ -4412,6 +4454,9 @@ static int mtk_charger_probe(struct platform_device *pdev)
 #endif /* CONFIG_PM */
 	srcu_init_notifier_head(&info->evt_nh);
 	mtk_charger_setup_files(pdev);
+	ret = mtk_charge_bypass_init(info);
+	if (ret)
+		chr_err("charge bypass interface unavailable: %d\n", ret);
 	mtk_charger_get_atm_mode(info);
 
 	for (i = 0; i < CHGS_SETTING_MAX; i++) {

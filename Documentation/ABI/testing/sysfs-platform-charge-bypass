@@ -1,0 +1,69 @@
+What:           /sys/devices/platform/charger/charge_bypass
+Date:           October 2026
+Contact:        Tetris device maintainers
+Description:
+                Read or write the connection-scoped charge inhibition request.
+                Accepts exactly 0 or 1, with an optional trailing newline.
+                Defaults to 0 and resets to 0 when the charging manager observes
+                cable removal. It is not a persistent setting.
+
+                Writing 1 inhibits the primary charger and all present charging
+                pumps and stops fast-charge algorithms. The independent vote
+                does not change health/thermal votes or battery FET controls.
+                The Basic policy restores the ordinary allowed input budget
+                after fast-charge shutdown and refreshes it while requested.
+                Source, negotiated USB/PD, thermal and known AICL caps remain
+                in effect. This path never writes charging current or voltage,
+                starts a fast-charge algorithm, or forces the input path on.
+                An unknown input budget, allowance below the hardware minimum,
+                or failed hardware transition adds a separate input-suspend
+                vote. That vote is removed only after the charging latches are
+                verified off and a valid current limit has been written and
+                read back, or on release. The battery can supply the phone
+                while input is suspended.
+                Normal power-path arbitration still honours the other owners.
+                An uninitialized manager returns -EAGAIN and a disconnected
+                supply returns -ENODEV.
+                Hardware failures are returned to the writer and the inhibit
+                request remains set, preventing subsequent charging enables.
+                Writing 1 again explicitly retries the operation.
+
+                Writing 0 removes only this vote and wakes normal policy. It
+                never writes charging-enable, power-path-enable, or an input
+                current limit. Release remains available after a failed enable.
+
+What:           /sys/devices/platform/charger/charge_bypass_status
+Date:           October 2026
+Contact:        Tetris device maintainers
+Description:
+                Read-only observation, formatted as one newline-terminated line:
+                version=1 requested=0 online=0 active=0 power_path=0 charging=0 error=0
+
+                All fields except error are unsigned decimal booleans, apart
+                from version which identifies the format. error is 0 or a
+                negative errno. Unknown charging state is represented by
+                charging=1 and a negative error, never a successful observation.
+
+                requested is the independent inhibition vote. online comes
+                from the primary charger's power-supply attachment state.
+                charging reports whether any present charger's charge-enable
+                latch is set; it does not use conversion-running status.
+                power_path reports the primary buck enabled and input high
+                impedance disabled, read from the same hardware register.
+
+                active is 1 only when requested and online, the input path is
+                enabled, every charge-enable latch is clear, and there is no
+                operation, input-policy or observation error. It does not prove
+                electrical battery isolation or guarantee sufficient adapter
+                power for the current system load. Another controller can
+                suspend the input path, yielding requested=1, active=0,
+                power_path=0.
+
+                Disable/stop errors remain visible until a successful explicit
+                retry, release, or cable removal. Transient input-policy errors
+                are refreshed by the manager and cannot clear disable/stop
+                errors. A pending PD contract yields -EAGAIN, an unrepresentable
+                current cap yields -ERANGE, and a charging algorithm without an
+                input-only callback yields -EOPNOTSUPP. Observation failures
+                affect that read. On an older or unsupported charging driver,
+                failed readback never produces active=1.

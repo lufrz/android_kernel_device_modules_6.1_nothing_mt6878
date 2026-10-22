@@ -173,6 +173,7 @@ struct mtk_charger_algorithm {
 			       void *v);
 	int (*change_current_setting)(struct mtk_charger *info);
 	void *algo_data;
+	int (*update_power_path_current)(struct mtk_charger *info);
 };
 
 struct charger_custom_data {
@@ -504,6 +505,13 @@ struct mtk_charger {
 	/* enable boot volt*/
 	bool enable_boot_volt;
 	bool reset_boot_volt_times;
+
+	/* Protected by charger_lock; independent of health and thermal votes. */
+	bool charge_bypass_requested;
+	bool charge_bypass_ready;
+	int charge_bypass_error;
+	int charge_bypass_input_error;
+	bool charge_bypass_input_blocked;
 };
 
 static inline int mtk_chg_alg_notify_call(struct mtk_charger *info,
@@ -547,6 +555,11 @@ extern int get_charger_input_current(struct mtk_charger *info,
 extern int get_charger_zcv(struct mtk_charger *info,
 	struct charger_device *chg);
 extern void _wake_up_charger(struct mtk_charger *info);
+int mtk_charge_bypass_init(struct mtk_charger *info);
+void mtk_charge_bypass_reset_locked(struct mtk_charger *info);
+int mtk_charge_bypass_update_input_locked(struct mtk_charger *info);
+int mtk_charger_refresh_power_path(struct mtk_charger *info);
+bool is_disable_charger(struct mtk_charger *info);
 
 /* functions for other */
 extern int mtk_chg_enable_vbus_ovp(bool enable);
