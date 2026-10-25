@@ -618,10 +618,12 @@ static int dlpt_probe(struct platform_device *pdev)
 
 static int __maybe_unused dlpt_suspend(struct device *d)
 {
-	if (!mutex_trylock(&dlpt.notify_lock))
-		return -EAGAIN;
+	mutex_lock(&dlpt.notify_lock);
 	dlpt.suspend_flag = true;
 	mutex_unlock(&dlpt.notify_lock);
+	del_timer_sync(&dlpt.notify_timer);
+	if (dlpt.notify_ws && dlpt.notify_ws->active)
+		__pm_relax(dlpt.notify_ws);
 	return 0;
 }
 
@@ -631,6 +633,7 @@ static int __maybe_unused dlpt_resume(struct device *d)
 	dlpt.suspend_flag = false;
 	mutex_unlock(&dlpt.notify_lock);
 	update_dlpt_imix_r();
+	mod_timer(&dlpt.notify_timer, jiffies + HZ * 10);
 	wake_up_interruptible(&dlpt.notify_waiter);
 	return 0;
 }

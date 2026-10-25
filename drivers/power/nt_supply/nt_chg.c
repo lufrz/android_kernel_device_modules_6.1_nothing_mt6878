@@ -1661,6 +1661,8 @@ static int nt_charger_pm_event(struct notifier_block *notifier,
 		spin_lock_irqsave(&nci->slock, flags);
 		if (nci->charger_wakelock && nci->charger_wakelock->active)
 			__pm_relax(nci->charger_wakelock);
+		if (nci->chg_wake && nci->chg_wake->active)
+			__pm_relax(nci->chg_wake);
 		spin_unlock_irqrestore(&nci->slock, flags);
 		break;
 	}
@@ -1989,9 +1991,11 @@ static void nt_update_status_function_work(struct work_struct *work)
 		spin_unlock_irqrestore(&nci->slock, flags);
 		nt_update_wakeup_status(nci);
 		mutex_unlock(&nci->charger_lock);
-		if (!nci->is_suspend)
+		if (!nci->is_suspend) {
+			unsigned int interval = nci->typec_attach ? (10 * HZ) : (120 * HZ);
 			queue_delayed_work(system_wq, &nci->nt_update_status_work,
-										round_jiffies(10 * HZ));
+										round_jiffies(interval));
+		}
 
 	//}
 	return;

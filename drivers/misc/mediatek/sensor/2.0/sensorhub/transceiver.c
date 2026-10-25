@@ -252,9 +252,7 @@ static void transceiver_report(struct transceiver_device *dev,
 	do {
 		if (action != FLUSH_ACTION) {
 			if (need_wakeup)
-// Change the expires time to 2 seconds.
-				// __pm_wakeup_event(dev->wakeup_src, 250);
-				__pm_wakeup_event(dev->wakeup_src, 2000);
+				__pm_wakeup_event(dev->wakeup_src, 250);
 			ret = manager->report(manager, event);
 		} else {
 			/*

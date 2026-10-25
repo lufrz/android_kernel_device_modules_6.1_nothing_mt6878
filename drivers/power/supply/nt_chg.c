@@ -1591,6 +1591,8 @@ static int nt_charger_pm_event(struct notifier_block *notifier,
 		spin_lock_irqsave(&nci->slock, flags);
 		if (nci->charger_wakelock && nci->charger_wakelock->active)
 			__pm_relax(nci->charger_wakelock);
+		if (nci->chg_wake && nci->chg_wake->active)
+			__pm_relax(nci->chg_wake);
 		spin_unlock_irqrestore(&nci->slock, flags);
 		break;
 	}
