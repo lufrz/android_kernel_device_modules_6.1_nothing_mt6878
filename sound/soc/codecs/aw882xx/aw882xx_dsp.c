@@ -113,8 +113,6 @@ static uint32_t afe_param_msg_id[MSG_PARAM_ID_MAX] = {
 #ifdef AW_MTK_PLATFORM_WITH_DSP
 extern int mtk_spk_send_ipi_buf_to_dsp(void *data_buffer, uint32_t data_size);
 extern int mtk_spk_recv_ipi_buf_from_dsp(int8_t *buffer, int16_t size, uint32_t *buf_len);
-extern int mtk_spk_read_ipi_buf_from_dsp(void *command, uint32_t command_size,
-	void *buffer, uint32_t size, uint32_t *actual_size);
 #elif defined AW_QCOM_PLATFORM
 extern int afe_get_topology(int port_id);
 extern int aw_send_afe_cal_apr(uint32_t param_id,
@@ -400,10 +398,7 @@ static int aw_read_msg_from_dsp(struct aw_device *aw_dev,
 {
 	int ret = 0;
 	int msg_num = -EINVAL;
-	aw_dsp_msg_t hdr[2] = { 0 };
-#ifdef AW_MTK_PLATFORM_WITH_DSP
-	uint32_t actual_size = 0;
-#endif
+	aw_dsp_msg_t hdr[2];
 
 	ret = aw_dsp_get_msg_num(aw_dev->channel, &msg_num);
 	if (ret < 0) {
@@ -421,19 +416,19 @@ static int aw_read_msg_from_dsp(struct aw_device *aw_dev,
 	mutex_lock(&g_aw_dsp_msg_lock);
 
 #ifdef AW_MTK_PLATFORM_WITH_DSP
-	ret = mtk_spk_read_ipi_buf_from_dsp(hdr, sizeof(hdr),
-			data_ptr, data_size, &actual_size);
-	/* These replies are fixed-size scalars; other reads may be variable-length. */
-	if (!ret && (msg_id == AW_MSG_ID_VERSION || msg_id == AW_MSG_ID_AUDIO_MIX) &&
-	    (data_size != sizeof(uint32_t) || actual_size != sizeof(uint32_t)))
-		ret = -EMSGSIZE;
+	ret = mtk_spk_send_ipi_buf_to_dsp(&hdr, 2 * sizeof(aw_dsp_msg_t));
 #else
 	ret = aw_qcom_write_data_to_dsp(afe_param_msg_id[msg_num],
 				&hdr[1], sizeof(aw_dsp_msg_t));
+#endif
 	if (ret < 0) {
 		aw_pr_err("msg_id:0x%x, send cmd failed", msg_id);
 		goto dsp_msg_failed;
 	}
+
+#ifdef AW_MTK_PLATFORM_WITH_DSP
+	ret = mtk_spk_recv_ipi_buf_from_dsp(data_ptr, data_size, &data_size);
+#else
 	ret = aw_qcom_read_data_from_dsp(afe_param_msg_id[msg_num],
 			data_ptr, (int)data_size);
 #endif
