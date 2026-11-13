@@ -7,7 +7,6 @@
  */
 
 #include "mt6878-afe-common.h"
-#include "tetris-audio.h"
 #include <linux/pm_runtime.h>
 
 #include "../common/mtk-sram-manager.h"
@@ -207,12 +206,10 @@ EXPORT_SYMBOL(mt6878_set_rch_dc_compensation);
 
 int mt6878_adda_dl_gain_control(bool mute)
 {
-	struct mt6878_afe_private *afe_priv;
 	unsigned int dl_gain_ctl;
 
 	if (!local_afe)
 		return -EPERM;
-	afe_priv = local_afe->platform_priv;
 
 	if (pm_runtime_status_suspended(local_afe->dev))
 		dev_info(local_afe->dev, "%s(), status suspended\n", __func__);
@@ -221,8 +218,6 @@ int mt6878_adda_dl_gain_control(bool mute)
 
 	if (mute)
 		dl_gain_ctl = MTK_AFE_ADDA_DL_GAIN_MUTE;
-	else if (READ_ONCE(afe_priv->tetris_media_receiver))
-		dl_gain_ctl = TETRIS_AUDIO_RECEIVER_GAIN;
 	else
 		dl_gain_ctl = 0xf74ff74f; //MTK_AFE_ADDA_DL_GAIN_NORMAL for platform before 6878
 

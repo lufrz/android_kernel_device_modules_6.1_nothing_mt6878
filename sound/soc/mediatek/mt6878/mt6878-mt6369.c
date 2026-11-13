@@ -15,7 +15,6 @@
 #include "mt6878-afe-common.h"
 #include "mt6878-afe-clk.h"
 #include "mt6878-afe-gpio.h"
-#include "tetris-audio.h"
 #include "../../codecs/mt6369.h"
 #include "../common/mtk-sp-spk-amp.h"
 #if IS_ENABLED(CONFIG_MTK_BATTERY_PERCENT_THROTTLING)
@@ -1966,13 +1965,6 @@ static int mt6878_mt6369_dev_probe(struct platform_device *pdev)
 	else
 		dev_info(&pdev->dev, "%s snd_soc_register_card pss %d\n",
 				__func__, ret);
-	if (!ret && of_property_read_bool(pdev->dev.of_node,
-					 "nothing,tetris-audio-lease")) {
-		int lease_ret = tetris_audio_lease_register(card);
-
-		if (lease_ret)
-			dev_warn(&pdev->dev, "Optional receiver unavailable: %d\n", lease_ret);
-	}
 	return ret;
 }
 
